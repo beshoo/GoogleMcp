@@ -257,3 +257,64 @@ class TestAllowlistMiddleware:
         assert result.is_error
         assert "flona.app" in result.content[0].text
         server.get_client_from_context.assert_not_called()  # type: ignore[attr-defined]
+
+
+# =========================================================================
+# update_app_details
+# =========================================================================
+
+
+class TestUpdateAppDetails:
+    @pytest.fixture
+    def details(self, edits: MagicMock) -> MagicMock:
+        details = edits.details.return_value
+        details.patch.return_value.execute.return_value = {
+            "contactEmail": "hello@flona.app",
+            "contactWebsite": "https://flona.app",
+            "defaultLanguage": "en-US",
+        }
+        return details
+
+    def test_fix_email(self, client: PlayStoreClient, edits: MagicMock, details: MagicMock) -> None:
+        result = client.update_app_details(PKG, contact_email=" hello@flona.app ")
+        assert result.success is True, result.message
+        assert result.updated_fields == ["contact_email"]
+        assert result.contact_email == "hello@flona.app"
+        assert result.sent_for_review is True
+        assert details.patch.call_args.kwargs["body"] == {"contactEmail": "hello@flona.app"}
+        assert edits.commit.call_count == 1
+
+    @pytest.mark.parametrize(
+        ("kwargs", "fragment"),
+        [
+            ({}, "Nothing to update"),
+            ({"contact_email": "hello@flona"}, "not a valid email"),
+            ({"contact_website": "flona.app"}, "http"),
+            ({"default_language": "English"}, "BCP-47"),
+        ],
+    )
+    def test_validation(
+        self, client: PlayStoreClient, edits: MagicMock, kwargs: dict[str, Any], fragment: str
+    ) -> None:
+        result = client.update_app_details(PKG, **kwargs)
+        assert result.success is False
+        assert fragment in result.message
+        edits.insert.assert_not_called()
+
+    def test_clear_phone_and_website(self, client: PlayStoreClient, details: MagicMock) -> None:
+        client.update_app_details(PKG, contact_phone="", contact_website="")
+        assert details.patch.call_args.kwargs["body"] == {"contactWebsite": "", "contactPhone": ""}
+
+    def test_api_failure_discards_edit(
+        self, client: PlayStoreClient, edits: MagicMock, details: MagicMock
+    ) -> None:
+        details.patch.return_value.execute.side_effect = _http_error(400, "Invalid email")
+        result = client.update_app_details(PKG, contact_email="a@b.co")
+        assert result.success is False
+        edits.commit.assert_not_called()
+        edits.delete.assert_called()
+
+    def test_tool_blocked_in_read_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server, "READ_ONLY", True)
+        result = server.update_app_details(PKG, contact_email="hello@flona.app")
+        assert "read-only" in result["error"]

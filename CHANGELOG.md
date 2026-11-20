@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `trial_eligibility`, creating and activating a free-trial offer.
 - `create_free_trial_offer`: add a free trial to an existing base plan, in
   every region the plan is sold in.
+- `update_app_details`: update the public contact email, website, phone and
+  default language (edits.details); `get_app_details` now also returns the phone.
 - `PLAY_STORE_MCP_ALLOWED_PACKAGES` limits the server to specific apps; calls
   for other packages (including inner code-mode calls) and account-wide user
   changes are rejected before the tool runs.

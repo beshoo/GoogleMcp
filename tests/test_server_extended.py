@@ -60,7 +60,7 @@ from play_store_mcp.server import (
 
 
 def test_server_uses_fastmcp_and_registers_all_tools() -> None:
-    """The server is built on the standalone fastmcp package with all 124 tools.
+    """The server is built on the standalone fastmcp package with all 125 tools.
 
     Depends on conftest.py pinning CODE_MODE=0 for the test process, since
     `server.mcp` is a module-level singleton built once at import time and
@@ -74,7 +74,7 @@ def test_server_uses_fastmcp_and_registers_all_tools() -> None:
 
     assert isinstance(server.mcp, fastmcp.FastMCP)
     tools = asyncio.run(server.mcp.list_tools())  # Sequence[Tool]
-    assert len(tools) == 124
+    assert len(tools) == 125
 
 
 @pytest.fixture

@@ -68,6 +68,25 @@ class AppDetails(BaseModel):
     developer_name: str | None = Field(None, description="Developer name")
     developer_email: str | None = Field(None, description="Developer email")
     developer_website: str | None = Field(None, description="Developer website")
+    developer_phone: str | None = Field(None, description="Developer contact phone")
+
+
+class AppDetailsUpdateResult(OperationResult):
+    """Result of updating the app's contact details / default language."""
+
+    package_name: str = Field(..., description=_DESC_PACKAGE_NAME)
+    updated_fields: list[str] = Field(default_factory=list, description="Fields that were set")
+    contact_email: str | None = Field(None, description="Contact email after the update")
+    contact_website: str | None = Field(None, description="Contact website after the update")
+    contact_phone: str | None = Field(None, description="Contact phone after the update")
+    default_language: str | None = Field(None, description="Default language after the update")
+    sent_for_review: bool | None = Field(
+        None,
+        description=(
+            "False when Play refused to send the change for review automatically; it is "
+            "saved and must be sent for review from the Play Console"
+        ),
+    )
 
 
 class Review(BaseModel):

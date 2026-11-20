@@ -242,6 +242,7 @@ Add to `.kiro/settings/mcp.json`:
 | `halt_release` | Halt a staged rollout |
 | `update_rollout` | Update rollout percentage for a staged release |
 | `get_app_details` | Get app metadata (title, description, etc.) |
+| `update_app_details` | Update the public contact email, website, phone and default language |
 
 ### Workflow Tools (this fork)
 

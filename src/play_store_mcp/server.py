@@ -200,7 +200,7 @@ def _build_transforms() -> list[Any]:
     Default: the tool surface is wrapped in the experimental CodeMode transform
     (search/get_schema/execute meta-tools + sandboxed execution), which cuts
     per-request tool-list overhead. Set CODE_MODE=0 to opt out and expose the
-    classic 124-tool surface instead.
+    classic 125-tool surface instead.
     """
     if not _code_mode_enabled():
         return []
@@ -469,6 +469,42 @@ def get_app_details(
 
     details = client.get_app_details(package_name, language)
     return details.model_dump()
+
+
+@mcp.tool()
+def update_app_details(
+    package_name: str,
+    contact_email: str | None = None,
+    contact_website: str | None = None,
+    contact_phone: str | None = None,
+    default_language: str | None = None,
+) -> dict[str, Any]:
+    """Update the app's public contact details and/or default language.
+
+    Only the fields you pass change. Contact details are shown publicly on the
+    store page. Disabled in read-only mode.
+
+    Args:
+        package_name: App package name
+        contact_email: Public contact email (required by Google Play)
+        contact_website: Public website URL (http/https), or "" to remove it
+        contact_phone: Public phone number, or "" to remove it
+        default_language: Default listing language, e.g. en-US (a listing in that
+            language must already exist)
+
+    Returns:
+        The values Google Play stored and whether the change was sent for review
+    """
+    if blocked := _read_only_block("update_app_details"):
+        return blocked
+    client = get_client_from_context()
+    return client.update_app_details(
+        package_name=package_name,
+        contact_email=contact_email,
+        contact_website=contact_website,
+        contact_phone=contact_phone,
+        default_language=default_language,
+    ).model_dump()
 
 
 # =============================================================================

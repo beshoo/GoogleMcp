@@ -27,6 +27,7 @@ from play_store_mcp.models import (
     AccessResult,
     Apk,
     AppDetails,
+    AppDetailsUpdateResult,
     AppImage,
     AppRecovery,
     AppRecoveryResult,
@@ -156,6 +157,7 @@ _LISTING_TEXT_FILES = {
 }
 _LANGUAGE_DIR_RE = re.compile(r"[a-z]{2,3}(-[A-Za-z0-9]{2,8})*")
 _DIGITS_RE = re.compile(r"(\d+)")
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
 # Monetization identifiers.
 _PRODUCT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.]{0,138}")
@@ -1540,10 +1542,106 @@ class PlayStoreClient:
                 developer_name=None,  # edits.details API has no developer name field
                 developer_email=details.get("contactEmail"),
                 developer_website=details.get("contactWebsite"),
+                developer_phone=details.get("contactPhone"),
             )
         except HttpError as e:
             self._logger.exception("Failed to fetch app details", error=str(e))
             raise PlayStoreClientError(f"Failed to fetch app details: {e.reason}") from e
+
+    def update_app_details(
+        self,
+        package_name: str,
+        contact_email: str | None = None,
+        contact_website: str | None = None,
+        contact_phone: str | None = None,
+        default_language: str | None = None,
+    ) -> AppDetailsUpdateResult:
+        """Update the app's store contact details and/or default language.
+
+        Only the fields you pass are changed. These details are shown publicly
+        on the store page.
+
+        Args:
+            package_name: App package name.
+            contact_email: Public contact email (required by Play; can't be cleared).
+            contact_website: Public website (http/https URL), or "" to remove it.
+            contact_phone: Public phone number, or "" to remove it.
+            default_language: Default listing language (BCP-47, e.g. "en-US");
+                a listing in that language must exist.
+
+        Returns:
+            Result with the values Play stored and whether it was sent for review.
+        """
+        self._logger.info("Updating app details", package_name=package_name)
+        body: dict[str, str] = {}
+        problems: list[str] = []
+        if contact_email is not None:
+            email = contact_email.strip()
+            if not _EMAIL_RE.fullmatch(email):
+                problems.append(f"contact_email {contact_email!r} is not a valid email address")
+            body["contactEmail"] = email
+        if contact_website is not None:
+            website = contact_website.strip()
+            if website and not website.lower().startswith(("http://", "https://")):
+                problems.append("contact_website must start with http:// or https://")
+            body["contactWebsite"] = website
+        if contact_phone is not None:
+            body["contactPhone"] = contact_phone.strip()
+        if default_language is not None:
+            language = default_language.strip()
+            if not _LANGUAGE_DIR_RE.fullmatch(language):
+                problems.append(f"default_language {default_language!r} is not a BCP-47 tag")
+            body["defaultLanguage"] = language
+        field_names = {
+            "contactEmail": "contact_email",
+            "contactWebsite": "contact_website",
+            "contactPhone": "contact_phone",
+            "defaultLanguage": "default_language",
+        }
+        fields = [field_names[k] for k in body]
+        if not body:
+            problems.append("Nothing to update: pass at least one field")
+        if problems:
+            return AppDetailsUpdateResult(
+                success=False,
+                message="; ".join(problems),
+                error="InvalidInput",
+                package_name=package_name,
+                updated_fields=fields,
+            )
+
+        edit_id: str | None = None
+        try:
+            service = self._get_service()
+            edit_id = self._create_edit(package_name)
+            stored = self._execute(
+                service.edits().details().patch(packageName=package_name, editId=edit_id, body=body)
+            )
+            sent = self._commit_edit(package_name, edit_id, allow_not_sent_for_review=True)
+            stored = stored or {}
+            return AppDetailsUpdateResult(
+                success=True,
+                message=(
+                    f"Updated {', '.join(fields)} for {package_name}"
+                    + self._review_note("completed", sent)
+                ),
+                package_name=package_name,
+                updated_fields=fields,
+                contact_email=stored.get("contactEmail"),
+                contact_website=stored.get("contactWebsite"),
+                contact_phone=stored.get("contactPhone"),
+                default_language=stored.get("defaultLanguage"),
+                sent_for_review=sent,
+            )
+        except Exception as e:
+            return self._fail_result(
+                AppDetailsUpdateResult,
+                "Failed to update app details",
+                e,
+                edit_id=edit_id,
+                package_name=package_name,
+                updated_fields=fields,
+            )
 
     # =========================================================================
     # Reviews API
