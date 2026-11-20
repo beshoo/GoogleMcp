@@ -171,6 +171,13 @@ _TRIAL_ELIGIBILITY: dict[str, dict[str, Any] | None] = {
     "developer_determined": None,
 }
 
+# How long a read-only edit is reused across read tools. Play limits how many
+# edits an app may create per day, and every read (releases, listings, images,
+# ...) needs an edit, so reads share one instead of creating one each.
+_READ_EDIT_TTL_SECONDS = 300.0
+# Don't reuse an edit this close to Play's own expiry.
+_READ_EDIT_EXPIRY_MARGIN_SECONDS = 60.0
+
 # Error fragments Play returns for the two commit situations we recover from.
 _DRAFT_APP_ERROR_MARKERS = ("draft app", "status draft")
 _NOT_SENT_FOR_REVIEW_MARKER = "changesnotsentforreview"
@@ -410,6 +417,10 @@ class PlayStoreClient:
         # _http_lock since that guards the transport call itself, which this
         # never touches.
         self._service_lock = threading.Lock()
+        # package_name -> (edit_id, monotonic creation time) of the shared
+        # read-only edit; see _acquire_read_edit.
+        self._read_edits: dict[str, tuple[str, float]] = {}
+        self._read_edit_lock = threading.Lock()
         self._logger = logger.bind(component="PlayStoreClient")
 
     # =========================================================================
@@ -709,6 +720,17 @@ class PlayStoreClient:
         self._logger.debug("Created edit", package_name=package_name, edit_id=edit_id)
         return edit_id
 
+    @classmethod
+    def _legacy_iap_hint(cls, error: BaseException) -> str:
+        """Extra guidance when Play has retired the legacy in-app products API."""
+        if isinstance(error, HttpError) and "new publishing api" in cls._http_error_text(error):
+            return (
+                ". Google has retired the legacy in-app products API for this app: use "
+                "list_one_time_products / get_one_time_product to read one-time products and "
+                "create_one_time_product_with_price to create them"
+            )
+        return ""
+
     @staticmethod
     def _http_error_text(error: BaseException) -> str:
         """Return an HttpError's reason plus response body, lower-cased, for matching."""
@@ -752,6 +774,57 @@ class PlayStoreClient:
             value=raw,
         )
         return {}
+
+    def _acquire_read_edit(self, package_name: str) -> str:
+        """Return an edit for read-only calls, reusing a recent one when possible.
+
+        Play caps edit creation per app per day ("Daily edit creation quota
+        exceeded"), and every read tool needs an edit. Reads therefore share
+        one cached edit per package for up to ``_READ_EDIT_TTL_SECONDS``. Before
+        reuse the edit is checked with edits.get (a read, which doesn't count
+        against the creation quota), so an expired or superseded edit is never
+        used. Commits made by this client drop the cached edit, so reads after
+        a change see the new state.
+        """
+        with self._read_edit_lock:
+            cached = self._read_edits.get(package_name)
+        if cached is not None:
+            edit_id, created = cached
+            fresh = time.monotonic() - created < _READ_EDIT_TTL_SECONDS
+            if fresh and self._edit_is_alive(package_name, edit_id):
+                return edit_id
+            self._forget_read_edit(package_name, edit_id)
+            if not fresh:
+                # Tidy up: it may still be open on Play's side.
+                self._delete_edit(package_name, edit_id)
+
+        edit_id = self._create_edit(package_name)
+        with self._read_edit_lock:
+            self._read_edits[package_name] = (edit_id, time.monotonic())
+        return edit_id
+
+    def _edit_is_alive(self, package_name: str, edit_id: str) -> bool:
+        """True if Play still accepts ``edit_id`` and it isn't about to expire."""
+        service = self._get_service()
+        try:
+            info = self._execute(service.edits().get(packageName=package_name, editId=edit_id))
+        except HttpError:
+            return False
+        expiry = (info or {}).get("expiryTimeSeconds")
+        if expiry:
+            try:
+                if float(expiry) - time.time() < _READ_EDIT_EXPIRY_MARGIN_SECONDS:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    def _forget_read_edit(self, package_name: str, edit_id: str | None = None) -> None:
+        """Drop the cached read edit for a package (only if it is ``edit_id``, when given)."""
+        with self._read_edit_lock:
+            cached = self._read_edits.get(package_name)
+            if cached is not None and (edit_id is None or cached[0] == edit_id):
+                del self._read_edits[package_name]
 
     def _commit_edit(
         self,
@@ -804,8 +877,10 @@ class PlayStoreClient:
                     **kwargs,
                 )
             )
+            self._forget_read_edit(package_name)
             self._logger.debug("Committed edit (not sent for review)", edit_id=edit_id)
             return False
+        self._forget_read_edit(package_name)
         self._logger.debug("Committed edit", package_name=package_name, edit_id=edit_id)
         return True
 
@@ -958,7 +1033,7 @@ class PlayStoreClient:
         """
         self._logger.info("Fetching releases", package_name=package_name)
         service = self._get_service()
-        edit_id = self._create_edit(package_name)
+        edit_id = self._acquire_read_edit(package_name)
 
         try:
             result = self._execute(
@@ -997,8 +1072,6 @@ class PlayStoreClient:
         except HttpError as e:
             self._logger.exception("Failed to fetch releases", error=str(e))
             raise PlayStoreClientError(f"Failed to fetch releases: {e.reason}") from e
-        finally:
-            self._delete_edit(package_name, edit_id)
 
     @staticmethod
     def _build_release_body(
@@ -1440,7 +1513,7 @@ class PlayStoreClient:
         """
         self._logger.info("Fetching app details", package_name=package_name, language=language)
         service = self._get_service()
-        edit_id = self._create_edit(package_name)
+        edit_id = self._acquire_read_edit(package_name)
 
         try:
             # Get app details
@@ -1471,8 +1544,6 @@ class PlayStoreClient:
         except HttpError as e:
             self._logger.exception("Failed to fetch app details", error=str(e))
             raise PlayStoreClientError(f"Failed to fetch app details: {e.reason}") from e
-        finally:
-            self._delete_edit(package_name, edit_id)
 
     # =========================================================================
     # Reviews API
@@ -2278,7 +2349,9 @@ class PlayStoreClient:
 
         except HttpError as e:
             self._logger.exception("Failed to list in-app products", error=str(e))
-            raise PlayStoreClientError(f"Failed to list in-app products: {e.reason}") from e
+            raise PlayStoreClientError(
+                f"Failed to list in-app products: {e.reason}{self._legacy_iap_hint(e)}"
+            ) from e
 
     def get_in_app_product(self, package_name: str, sku: str) -> InAppProduct:
         """Get details of a specific in-app product.
@@ -2301,7 +2374,9 @@ class PlayStoreClient:
 
         except HttpError as e:
             self._logger.exception("Failed to get in-app product", error=str(e))
-            raise PlayStoreClientError(f"Failed to get in-app product: {e.reason}") from e
+            raise PlayStoreClientError(
+                f"Failed to get in-app product: {e.reason}{self._legacy_iap_hint(e)}"
+            ) from e
 
     @staticmethod
     def _parse_in_app_product(package_name: str, product_data: dict[str, Any]) -> InAppProduct:
@@ -2347,7 +2422,9 @@ class PlayStoreClient:
 
         except HttpError as e:
             self._logger.exception("Failed to create in-app product", error=str(e))
-            raise PlayStoreClientError(f"Failed to create in-app product: {e.reason}") from e
+            raise PlayStoreClientError(
+                f"Failed to create in-app product: {e.reason}{self._legacy_iap_hint(e)}"
+            ) from e
 
     def update_in_app_product(
         self,
@@ -2384,7 +2461,9 @@ class PlayStoreClient:
 
         except HttpError as e:
             self._logger.exception("Failed to update in-app product", error=str(e))
-            raise PlayStoreClientError(f"Failed to update in-app product: {e.reason}") from e
+            raise PlayStoreClientError(
+                f"Failed to update in-app product: {e.reason}{self._legacy_iap_hint(e)}"
+            ) from e
 
     def patch_in_app_product(
         self, package_name: str, sku: str, product: dict[str, Any]
@@ -2410,7 +2489,9 @@ class PlayStoreClient:
 
         except HttpError as e:
             self._logger.exception("Failed to patch in-app product", error=str(e))
-            raise PlayStoreClientError(f"Failed to patch in-app product: {e.reason}") from e
+            raise PlayStoreClientError(
+                f"Failed to patch in-app product: {e.reason}{self._legacy_iap_hint(e)}"
+            ) from e
 
     def delete_in_app_product(self, package_name: str, sku: str) -> InAppProductActionResult:
         """Delete an in-app product.
@@ -2436,13 +2517,15 @@ class PlayStoreClient:
             )
 
         except Exception as e:
-            return self._fail_result(
+            result = self._fail_result(
                 InAppProductActionResult,
                 "Failed to delete in-app product",
                 e,
                 package_name=package_name,
                 sku=sku,
             )
+            result.message += self._legacy_iap_hint(e)
+            return result
 
     def batch_get_in_app_products(self, package_name: str, skus: list[str]) -> list[InAppProduct]:
         """Get details for multiple in-app products.
@@ -2471,7 +2554,9 @@ class PlayStoreClient:
 
         except HttpError as e:
             self._logger.exception("Failed to batch get in-app products", error=str(e))
-            raise PlayStoreClientError(f"Failed to batch get in-app products: {e.reason}") from e
+            raise PlayStoreClientError(
+                f"Failed to batch get in-app products: {e.reason}{self._legacy_iap_hint(e)}"
+            ) from e
 
     def batch_delete_in_app_products(
         self, package_name: str, skus: list[str]
@@ -2506,13 +2591,15 @@ class PlayStoreClient:
             )
 
         except Exception as e:
-            return self._fail_result(
+            result = self._fail_result(
                 InAppProductActionResult,
                 "Failed to batch delete in-app products",
                 e,
                 package_name=package_name,
                 sku=None,
             )
+            result.message += self._legacy_iap_hint(e)
+            return result
 
     # =========================================================================
     # One-Time Product Catalog API
@@ -4346,7 +4433,7 @@ class PlayStoreClient:
         """
         self._logger.info("Getting store listing", package_name=package_name, language=language)
         service = self._get_service()
-        edit_id = self._create_edit(package_name)
+        edit_id = self._acquire_read_edit(package_name)
 
         try:
             listing_data = self._execute(
@@ -4365,8 +4452,6 @@ class PlayStoreClient:
         except HttpError as e:
             self._logger.exception("Failed to get store listing", error=str(e))
             raise PlayStoreClientError(f"Failed to get store listing: {e.reason}") from e
-        finally:
-            self._delete_edit(package_name, edit_id)
 
     def update_listing(
         self,
@@ -4482,7 +4567,7 @@ class PlayStoreClient:
         """
         self._logger.info("Listing all store listings", package_name=package_name)
         service = self._get_service()
-        edit_id = self._create_edit(package_name)
+        edit_id = self._acquire_read_edit(package_name)
 
         try:
             result = self._execute(
@@ -4504,8 +4589,6 @@ class PlayStoreClient:
         except HttpError as e:
             self._logger.exception("Failed to list store listings", error=str(e))
             raise PlayStoreClientError(f"Failed to list store listings: {e.reason}") from e
-        finally:
-            self._delete_edit(package_name, edit_id)
 
     # =========================================================================
     # Testers API
@@ -4523,7 +4606,7 @@ class PlayStoreClient:
         """
         self._logger.info("Getting testers", package_name=package_name, track=track)
         service = self._get_service()
-        edit_id = self._create_edit(package_name)
+        edit_id = self._acquire_read_edit(package_name)
 
         try:
             testers_data = self._execute(
@@ -4540,8 +4623,6 @@ class PlayStoreClient:
                 # No testers configured
                 return TesterInfo(track=track, google_groups=[])
             raise PlayStoreClientError(f"Failed to get testers: {e.reason}") from e
-        finally:
-            self._delete_edit(package_name, edit_id)
 
     def update_testers(
         self,
@@ -4703,7 +4784,7 @@ class PlayStoreClient:
             type=expansion_file_type,
         )
         service = self._get_service()
-        edit_id = self._create_edit(package_name)
+        edit_id = self._acquire_read_edit(package_name)
 
         try:
             expansion_data = self._execute(
@@ -4733,8 +4814,6 @@ class PlayStoreClient:
                 )
             self._logger.exception("Failed to get expansion file", error=str(e))
             raise PlayStoreClientError(f"Failed to get expansion file: {e.reason}") from e
-        finally:
-            self._delete_edit(package_name, edit_id)
 
     # =========================================================================
     # Edit Uploads API (apks, bundles, deobfuscation files, expansion files)
@@ -4751,7 +4830,7 @@ class PlayStoreClient:
         """
         self._logger.info("Listing APKs", package_name=package_name)
         service = self._get_service()
-        edit_id = self._create_edit(package_name)
+        edit_id = self._acquire_read_edit(package_name)
 
         try:
             result = self._execute(
@@ -4772,8 +4851,6 @@ class PlayStoreClient:
         except HttpError as e:
             self._logger.exception("Failed to list APKs", error=str(e))
             raise PlayStoreClientError(f"Failed to list APKs: {e.reason}") from e
-        finally:
-            self._delete_edit(package_name, edit_id)
 
     def list_bundles(self, package_name: str) -> list[Bundle]:
         """List the app bundles currently attached to a new edit.
@@ -4786,7 +4863,7 @@ class PlayStoreClient:
         """
         self._logger.info("Listing bundles", package_name=package_name)
         service = self._get_service()
-        edit_id = self._create_edit(package_name)
+        edit_id = self._acquire_read_edit(package_name)
 
         try:
             result = self._execute(
@@ -4804,8 +4881,6 @@ class PlayStoreClient:
         except HttpError as e:
             self._logger.exception("Failed to list bundles", error=str(e))
             raise PlayStoreClientError(f"Failed to list bundles: {e.reason}") from e
-        finally:
-            self._delete_edit(package_name, edit_id)
 
     def upload_apk(self, package_name: str, apk_path: str) -> Apk:
         """Upload an APK to a new edit and commit it.
@@ -5048,7 +5123,7 @@ class PlayStoreClient:
             image_type=image_type,
         )
         service = self._get_service()
-        edit_id = self._create_edit(package_name)
+        edit_id = self._acquire_read_edit(package_name)
 
         try:
             result = self._execute(
@@ -5068,8 +5143,6 @@ class PlayStoreClient:
         except HttpError as e:
             self._logger.exception("Failed to list images", error=str(e))
             raise PlayStoreClientError(f"Failed to list images: {e.reason}") from e
-        finally:
-            self._delete_edit(package_name, edit_id)
 
     def upload_image(
         self,

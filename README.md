@@ -401,6 +401,7 @@ applied in one commit; use `dry_run=true` to preview.
 | `PLAY_STORE_MCP_READ_ONLY` | Disable all write operations (deploy, promote, rollout, reply, listing/tester updates) | No (default: off) |
 | `PLAY_STORE_MCP_DOWNLOAD_DIR` | Directory that APK/AAB downloads are confined to (path-traversal / arbitrary-write protection). Downloads are always confined; defaults to the working directory when unset | No (defaults to cwd); **recommended** for network/hosted deployments — the server warns if unset |
 | `CODE_MODE` | Set to `0` to opt out of the code-mode transform and use the classic tool list | No (default: on) |
+| `PLAY_STORE_MCP_ALLOWED_PACKAGES` | Limit the server to these apps (comma separated, e.g. `com.example.app`). Calls for any other `package_name` are rejected, as are account-wide user changes (`create_user`/`update_user`/`delete_user`) | No (default: all apps the key can access) |
 | `PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR` | What a commit does when other changes are already in review: `error` refuses instead of cancelling that review; `cancel` cancels it and resubmits (Google's default) | No (default: Google's default, which cancels the in-progress review) |
 
 ## 🧪 Development

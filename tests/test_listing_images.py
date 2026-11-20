@@ -172,7 +172,8 @@ def test_list_images_success():
         imageType="phoneScreenshots",
     )
     # Read pattern: edit abandoned, never committed.
-    _edits(service).delete.assert_called_once_with(packageName="com.example.app", editId="edit-123")
+    # Reads share one cached edit (Play caps edit creation per day): not deleted.
+    _edits(service).delete.assert_not_called()
     _edits(service).commit.assert_not_called()
 
 
@@ -185,11 +186,12 @@ def test_list_images_empty_response():
     images = client.list_images("com.example.app", "en-US", "icon")
 
     assert images == []
-    _edits(service).delete.assert_called_once_with(packageName="com.example.app", editId="edit-123")
+    # Reads share one cached edit (Play caps edit creation per day): not deleted.
+    _edits(service).delete.assert_not_called()
     _edits(service).commit.assert_not_called()
 
 
-def test_list_images_http_error_still_abandons_edit():
+def test_list_images_http_error_does_not_commit():
     service = MagicMock()
     _prime_edit(service)
     _images(service).list.return_value.execute.side_effect = _make_http_error()
@@ -198,7 +200,8 @@ def test_list_images_http_error_still_abandons_edit():
     with pytest.raises(PlayStoreClientError, match="Failed to list images"):
         client.list_images("com.example.app", "en-US", "icon")
 
-    _edits(service).delete.assert_called_once_with(packageName="com.example.app", editId="edit-123")
+    # Reads share one cached edit (Play caps edit creation per day): not deleted.
+    _edits(service).delete.assert_not_called()
     _edits(service).commit.assert_not_called()
 
 

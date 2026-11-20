@@ -32,6 +32,7 @@ from play_store_mcp.client import (
     release_status_problem,
 )
 from play_store_mcp.failure_log import FailureLogMiddleware
+from play_store_mcp.package_guard import PackageAllowlistMiddleware
 
 # Configure structured logging to stderr (stdout is reserved for MCP JSON-RPC)
 log_level = os.environ.get("PLAY_STORE_MCP_LOG_LEVEL", "INFO")
@@ -224,6 +225,8 @@ mcp = FastMCP(
 )
 # No-op unless PLAY_STORE_MCP_FAILURE_LOG is on (checked per call).
 mcp.add_middleware(FailureLogMiddleware())
+# No-op unless PLAY_STORE_MCP_ALLOWED_PACKAGES is set (checked per call).
+mcp.add_middleware(PackageAllowlistMiddleware())
 
 
 # =============================================================================
@@ -894,6 +897,11 @@ def get_product_purchase_v2(
 def list_in_app_products(package_name: str) -> list[dict[str, Any]]:
     """List all in-app products for an app.
 
+    DEPRECATED (legacy inappproducts API): Google has retired this API for apps on the
+    new publishing model and answers "Please migrate to the new publishing API".
+    Prefer list_one_time_products / get_one_time_product and
+    create_one_time_product_with_price.
+
     Args:
         package_name: App package name
 
@@ -912,6 +920,11 @@ def get_in_app_product(
     sku: str,
 ) -> dict[str, Any]:
     """Get details of a specific in-app product.
+
+    DEPRECATED (legacy inappproducts API): Google has retired this API for apps on the
+    new publishing model and answers "Please migrate to the new publishing API".
+    Prefer list_one_time_products / get_one_time_product and
+    create_one_time_product_with_price.
 
     Args:
         package_name: App package name
@@ -932,6 +945,11 @@ def create_in_app_product(
     product: dict[str, Any],
 ) -> dict[str, Any]:
     """Create a new in-app product in the catalog.
+
+    DEPRECATED (legacy inappproducts API): Google has retired this API for apps on the
+    new publishing model and answers "Please migrate to the new publishing API".
+    Prefer list_one_time_products / get_one_time_product and
+    create_one_time_product_with_price.
 
     Disabled in read-only mode.
 
@@ -959,6 +977,11 @@ def update_in_app_product(
     auto_convert_missing_prices: bool = False,
 ) -> dict[str, Any]:
     """Update (replace) an existing in-app product.
+
+    DEPRECATED (legacy inappproducts API): Google has retired this API for apps on the
+    new publishing model and answers "Please migrate to the new publishing API".
+    Prefer list_one_time_products / get_one_time_product and
+    create_one_time_product_with_price.
 
     Disabled in read-only mode.
 
@@ -993,6 +1016,11 @@ def patch_in_app_product(
 ) -> dict[str, Any]:
     """Partially update an existing in-app product.
 
+    DEPRECATED (legacy inappproducts API): Google has retired this API for apps on the
+    new publishing model and answers "Please migrate to the new publishing API".
+    Prefer list_one_time_products / get_one_time_product and
+    create_one_time_product_with_price.
+
     Disabled in read-only mode.
 
     Args:
@@ -1018,6 +1046,11 @@ def delete_in_app_product(
 ) -> dict[str, Any]:
     """Delete an in-app product from the catalog.
 
+    DEPRECATED (legacy inappproducts API): Google has retired this API for apps on the
+    new publishing model and answers "Please migrate to the new publishing API".
+    Prefer list_one_time_products / get_one_time_product and
+    create_one_time_product_with_price.
+
     Disabled in read-only mode.
 
     Args:
@@ -1042,6 +1075,11 @@ def batch_get_in_app_products(
 ) -> list[dict[str, Any]]:
     """Get details for multiple in-app products at once.
 
+    DEPRECATED (legacy inappproducts API): Google has retired this API for apps on the
+    new publishing model and answers "Please migrate to the new publishing API".
+    Prefer list_one_time_products / get_one_time_product and
+    create_one_time_product_with_price.
+
     Args:
         package_name: App package name
         skus: List of product SKUs to retrieve
@@ -1061,6 +1099,11 @@ def batch_delete_in_app_products(
     skus: list[str],
 ) -> dict[str, Any]:
     """Delete multiple in-app products in a single operation.
+
+    DEPRECATED (legacy inappproducts API): Google has retired this API for apps on the
+    new publishing model and answers "Please migrate to the new publishing API".
+    Prefer list_one_time_products / get_one_time_product and
+    create_one_time_product_with_price.
 
     Disabled in read-only mode.
 

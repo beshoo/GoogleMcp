@@ -116,11 +116,12 @@ def test_list_apks_success():
         packageName="com.example.app", editId="edit-123"
     )
     # Read pattern: edit abandoned, never committed.
-    _edits(service).delete.assert_called_once_with(packageName="com.example.app", editId="edit-123")
+    # Reads share one cached edit (Play caps edit creation per day): not deleted.
+    _edits(service).delete.assert_not_called()
     _edits(service).commit.assert_not_called()
 
 
-def test_list_apks_http_error_still_abandons_edit():
+def test_list_apks_http_error_does_not_commit():
     service = MagicMock()
     _prime_edit(service)
     _edits(service).apks.return_value.list.return_value.execute.side_effect = _make_http_error()
@@ -129,7 +130,8 @@ def test_list_apks_http_error_still_abandons_edit():
     with pytest.raises(PlayStoreClientError, match="Failed to list APKs"):
         client.list_apks("com.example.app")
 
-    _edits(service).delete.assert_called_once_with(packageName="com.example.app", editId="edit-123")
+    # Reads share one cached edit (Play caps edit creation per day): not deleted.
+    _edits(service).delete.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -157,11 +159,12 @@ def test_list_bundles_success():
     _edits(service).bundles.return_value.list.assert_called_once_with(
         packageName="com.example.app", editId="edit-123"
     )
-    _edits(service).delete.assert_called_once_with(packageName="com.example.app", editId="edit-123")
+    # Reads share one cached edit (Play caps edit creation per day): not deleted.
+    _edits(service).delete.assert_not_called()
     _edits(service).commit.assert_not_called()
 
 
-def test_list_bundles_http_error_still_abandons_edit():
+def test_list_bundles_http_error_does_not_commit():
     service = MagicMock()
     _prime_edit(service)
     _edits(service).bundles.return_value.list.return_value.execute.side_effect = _make_http_error()
@@ -170,7 +173,8 @@ def test_list_bundles_http_error_still_abandons_edit():
     with pytest.raises(PlayStoreClientError, match="Failed to list bundles"):
         client.list_bundles("com.example.app")
 
-    _edits(service).delete.assert_called_once_with(packageName="com.example.app", editId="edit-123")
+    # Reads share one cached edit (Play caps edit creation per day): not deleted.
+    _edits(service).delete.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
