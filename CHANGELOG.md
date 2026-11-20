@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `trial_eligibility`, creating and activating a free-trial offer.
 - `create_free_trial_offer`: add a free trial to an existing base plan, in
   every region the plan is sold in.
+- `PLAY_STORE_MCP_ALLOWED_PACKAGES` limits the server to specific apps; calls
+  for other packages (including inner code-mode calls) and account-wide user
+  changes are rejected before the tool runs.
 - `deploy_app` accepts `release_status` (`draft`, `completed`, `inProgress`);
   values that contradict `rollout_percentage` are rejected.
 - `PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR` (`error` | `cancel`) sets
@@ -50,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are raised instead of overwriting fields with empty values.
 
 ### Fixed
+- Read tools (releases, listings, images, testers, APKs, bundles, expansion
+  files) share one cached edit per app instead of creating and deleting one per
+  call, which quickly hit Play's "Daily edit creation quota exceeded". The
+  edit is checked before reuse and dropped after any commit.
+- The legacy in-app products tools are marked deprecated, and Google's
+  "Please migrate to the new publishing API" error now points to the
+  one-time product tools.
 - `validate_listing_text` and the listing tools enforced a 50-character
   title; Google Play's app-name limit is 30.
 
