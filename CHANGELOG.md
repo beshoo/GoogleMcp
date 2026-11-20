@@ -26,7 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sync_listing_from_directory`: sync listing text and images for every
   language from a fastlane-`supply`-style folder in one commit, with
   validation and `dry_run`.
-- `deploy_app` accepts `release_status` (e.g. `"draft"`).
+- `create_subscription_with_price` accepts `free_trial` (e.g. `"P1M"`) and
+  `trial_eligibility`, creating and activating a free-trial offer.
+- `create_free_trial_offer`: add a free trial to an existing base plan, in
+  every region the plan is sold in.
+- `deploy_app` accepts `release_status` (`draft`, `completed`, `inProgress`);
+  values that contradict `rollout_percentage` are rejected.
 - `PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR` (`error` | `cancel`) sets
   `changesInReviewBehavior` on every commit, so a commit can refuse instead of
   silently cancelling a review already in progress.
@@ -35,9 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `deploy_app` and `promote_release` retry the release as `draft` when Play
   says the app is still a draft (never published), so the first upload of a
   new app no longer fails.
-- Commits that Play refuses to send for review automatically are retried with
+- For deploys, promotions, image replacement and listing sync, commits that
+  Play refuses to send for review automatically are retried with
   `changesNotSentForReview=true`; the result tells you to send the changes
-  for review from the Play Console.
+  for review from the Play Console. Other tools still report the error.
+- Product/subscription creation reports a partial success (with `warnings`)
+  when the product was created but activation or the free trial failed.
+- `update_listing` only treats a 404 as "no listing yet"; other read errors
+  are raised instead of overwriting fields with empty values.
 
 ### Fixed
 - `validate_listing_text` and the listing tools enforced a 50-character

@@ -29,6 +29,7 @@ from play_store_mcp.client import (
     DEFAULT_REGIONS_VERSION,
     PlayStoreClient,
     PlayStoreClientError,
+    release_status_problem,
 )
 from play_store_mcp.failure_log import FailureLogMiddleware
 
@@ -142,10 +143,6 @@ def _validate_deploy_file(file_path: str) -> str | None:
     return None
 
 
-# Release statuses deploy_app accepts as an explicit override.
-_RELEASE_STATUSES = frozenset({"draft", "completed", "inProgress", "halted"})
-
-
 def _validate_rollout(pct: float) -> str | None:
     """Return error message if rollout percentage is invalid, None if valid."""
     if not (0.0 <= pct <= 100.0):
@@ -202,7 +199,7 @@ def _build_transforms() -> list[Any]:
     Default: the tool surface is wrapped in the experimental CodeMode transform
     (search/get_schema/execute meta-tools + sandboxed execution), which cuts
     per-request tool-list overhead. Set CODE_MODE=0 to opt out and expose the
-    classic 123-tool surface instead.
+    classic 124-tool surface instead.
     """
     if not _code_mode_enabled():
         return []
@@ -254,10 +251,10 @@ def deploy_app(
                       or use release_notes_multilang for multiple languages)
         release_notes_language: Language code for release notes (default: en-US)
         rollout_percentage: Rollout percentage (0-100). Default 100 for full rollout.
-        release_status: Optional release status: draft, completed, inProgress or
-            halted. Default is completed (inProgress when rollout < 100). Use
-            "draft" to stage a release without rolling it out. Apps that have
-            never been published are automatically uploaded as a draft.
+        release_status: Optional release status: draft, completed (needs rollout 100)
+            or inProgress (needs rollout < 100). Default is completed (inProgress
+            when rollout < 100). Use "draft" to stage a release without rolling it
+            out. Apps that have never been published are uploaded as a draft.
 
     Returns:
         Deployment result with success status and details
@@ -268,8 +265,8 @@ def deploy_app(
         return {"error": err}
     if err := _validate_rollout(rollout_percentage):
         return {"error": err}
-    if release_status is not None and release_status not in _RELEASE_STATUSES:
-        return {"error": "release_status must be one of: draft, completed, inProgress, halted"}
+    if err := release_status_problem(release_status, rollout_percentage):
+        return {"error": err}
 
     client = get_client_from_context()
 
@@ -3612,7 +3609,7 @@ def upload_internal_app_sharing_bundle(
 
 @mcp.tool()
 def convert_region_prices(
-    package_name: str, price: str, currency_code: str = "USD"
+    package_name: str, price: str | float, currency_code: str = "USD"
 ) -> dict[str, Any]:
     """Convert one price into Google Play prices for every billable region.
 
@@ -3638,7 +3635,7 @@ def create_one_time_product_with_price(
     product_id: str,
     title: str,
     description: str,
-    price: str,
+    price: str | float,
     currency_code: str = "USD",
     language: str = "en-US",
     extra_listings: dict[str, dict[str, str]] | None = None,
@@ -3730,7 +3727,7 @@ def create_subscription_with_price(
     package_name: str,
     product_id: str,
     title: str,
-    price: str,
+    price: str | float,
     base_plan_id: str = "monthly",
     billing_period: str = "P1M",
     currency_code: str = "USD",
@@ -3740,12 +3737,15 @@ def create_subscription_with_price(
     extra_listings: dict[str, dict[str, Any]] | None = None,
     grace_period: str | None = None,
     activate: bool = True,
+    free_trial: str | None = None,
+    trial_eligibility: str = "new_customers",
 ) -> dict[str, Any]:
     """Create an auto-renewing subscription priced in every region from one price.
 
     Creates the subscription with one base plan, converts the price to every
     region with Play's regional pricing, and activates the base plan.
-    Use create_subscription_offer afterwards for free trials / intro prices.
+    Optionally adds a free trial: e.g. free_trial="P1M" gives new subscribers
+    1 month free, then charges `price` every billing period.
     Disabled in read-only mode.
 
     Args:
@@ -3763,9 +3763,16 @@ def create_subscription_with_price(
             {"de-DE": {"title": "...", "description": "...", "benefits": ["..."]}}
         grace_period: Optional grace period: P3D, P7D, P14D or P30D
         activate: Activate the base plan (default true)
+        free_trial: Optional free period before the first charge, ISO 8601:
+            P3D, P7D, P14D, P1M, ... (e.g. "P1M" = 1 month free)
+        trial_eligibility: Who gets the trial: new_customers (default; never had
+            this subscription), new_customers_any_subscription (never had any
+            subscription in this app), or developer_determined (only when the
+            app asks for the offer)
 
     Returns:
-        Result with base price, regions version and number of priced regions
+        Result with base price, regions version, number of priced regions, the
+        free trial offer ID, and any warnings needing follow-up
     """
     if blocked := _read_only_block("create_subscription_with_price"):
         return blocked
@@ -3783,6 +3790,53 @@ def create_subscription_with_price(
         benefits=benefits,
         extra_listings=extra_listings,
         grace_period=grace_period,
+        activate=activate,
+        free_trial=free_trial,
+        trial_eligibility=trial_eligibility,
+    ).model_dump()
+
+
+@mcp.tool()
+def create_free_trial_offer(
+    package_name: str,
+    product_id: str,
+    base_plan_id: str,
+    trial_duration: str = "P1M",
+    offer_id: str = "free-trial",
+    eligibility: str = "new_customers",
+    activate: bool = True,
+) -> dict[str, Any]:
+    """Add a free trial to an existing subscription base plan.
+
+    Subscribers get `trial_duration` free, then pay the base plan's normal
+    price every period. The offer is enabled in every region the base plan is
+    sold in. Disabled in read-only mode.
+
+    Args:
+        package_name: App package name
+        product_id: Subscription product ID
+        base_plan_id: Base plan to attach the trial to (must be active to activate
+            the offer)
+        trial_duration: Free period, ISO 8601: P3D, P7D, P14D, P1M, ... (default P1M)
+        offer_id: Offer ID - lowercase letters, digits, '-' (default "free-trial")
+        eligibility: new_customers (default; never had this subscription),
+            new_customers_any_subscription (never had any subscription in this
+            app), or developer_determined (only when the app asks for the offer)
+        activate: Activate the offer (default true)
+
+    Returns:
+        Result with the offer ID, number of regions and activation state
+    """
+    if blocked := _read_only_block("create_free_trial_offer"):
+        return blocked
+    client = get_client_from_context()
+    return client.create_free_trial_offer(
+        package_name=package_name,
+        product_id=product_id,
+        base_plan_id=base_plan_id,
+        trial_duration=trial_duration,
+        offer_id=offer_id,
+        eligibility=eligibility,
         activate=activate,
     ).model_dump()
 

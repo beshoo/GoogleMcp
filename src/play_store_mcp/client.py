@@ -51,6 +51,7 @@ from play_store_mcp.models import (
     ListingSyncLanguage,
     ListingSyncResult,
     ListingUpdateResult,
+    OfferSetupResult,
     OneTimeProduct,
     OneTimeProductActionResult,
     OneTimeProductOffer,
@@ -160,6 +161,15 @@ _DIGITS_RE = re.compile(r"(\d+)")
 _PRODUCT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.]{0,138}")
 _OPTION_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 _BILLING_PERIODS = frozenset({"P1W", "P1M", "P3M", "P6M", "P1Y"})
+_TRIAL_DURATION_RE = re.compile(r"P[1-9]\d*[DWMY]")
+
+# Free-trial eligibility -> SubscriptionOffer.targeting. "developer_determined"
+# has no targeting: the app decides who sees the offer (via offer tags).
+_TRIAL_ELIGIBILITY: dict[str, dict[str, Any] | None] = {
+    "new_customers": {"acquisitionRule": {"scope": {"thisSubscription": {}}}},
+    "new_customers_any_subscription": {"acquisitionRule": {"scope": {"anySubscriptionInApp": {}}}},
+    "developer_determined": None,
+}
 
 # Error fragments Play returns for the two commit situations we recover from.
 _DRAFT_APP_ERROR_MARKERS = ("draft app", "status draft")
@@ -254,6 +264,30 @@ def _parse_review(review_data: dict[str, Any]) -> Review | None:
             _parse_timestamp(dev_comment.get("lastModified")) if dev_comment else None
         ),
     )
+
+
+RELEASE_STATUSES = ("draft", "completed", "inProgress")
+
+
+def release_status_problem(release_status: str | None, rollout_percentage: float) -> str | None:
+    """Return why an explicit release status conflicts with the rollout, or None.
+
+    Guards against a status silently overriding the percentage, e.g.
+    ``completed`` with a 5% rollout would ship to 100% of users.
+    """
+    if release_status is None:
+        return None
+    if release_status not in RELEASE_STATUSES:
+        return "release_status must be one of: " + ", ".join(RELEASE_STATUSES)
+    if release_status == "completed" and rollout_percentage < 100:
+        return (
+            "release_status='completed' releases to 100% of users, but rollout_percentage is "
+            f"{rollout_percentage:g}. Omit release_status for a staged rollout, or set "
+            "rollout_percentage=100."
+        )
+    if release_status == "inProgress" and rollout_percentage >= 100:
+        return "release_status='inProgress' is a staged rollout; set rollout_percentage below 100"
+    return None
 
 
 def _is_retryable_status(status: int, *, retry_server_errors: bool) -> bool:
@@ -702,26 +736,46 @@ class PlayStoreClient:
             return False
         return _NOT_SENT_FOR_REVIEW_MARKER in cls._http_error_text(error)
 
-    @staticmethod
-    def _commit_kwargs() -> dict[str, Any]:
+    def _commit_kwargs(self) -> dict[str, Any]:
         """Extra edits.commit query parameters derived from the environment."""
-        behavior = os.environ.get("PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR", "").strip().lower()
+        raw = os.environ.get("PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR", "").strip()
+        if not raw:
+            return {}
+        behavior = raw.lower()
         if behavior in _IN_REVIEW_BEHAVIORS:
             return {"changesInReviewBehavior": _IN_REVIEW_BEHAVIORS[behavior]}
+        if raw.upper() in _IN_REVIEW_BEHAVIORS.values():
+            return {"changesInReviewBehavior": raw.upper()}
+        self._logger.warning(
+            "Ignoring unknown PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR; use 'error' or 'cancel'. "
+            "Commits will use Google's default, which cancels changes already in review.",
+            value=raw,
+        )
         return {}
 
-    def _commit_edit(self, package_name: str, edit_id: str) -> bool:
+    def _commit_edit(
+        self,
+        package_name: str,
+        edit_id: str,
+        *,
+        allow_not_sent_for_review: bool = False,
+    ) -> bool:
         """Commit an edit.
 
-        If Play refuses to send the changes for review automatically (it says
-        to set ``changesNotSentForReview``, e.g. after a rejection or when
-        managed publishing requires it), the commit is retried with that flag
-        so the changes are saved; they then have to be sent for review from
-        the Play Console.
+        With ``allow_not_sent_for_review``, if Play refuses to send the
+        changes for review automatically (it says to set
+        ``changesNotSentForReview``, e.g. after a rejection or when managed
+        publishing requires it), the commit is retried with that flag so the
+        changes are saved; they then have to be sent for review from the Play
+        Console. Only callers that surface the False return value to the user
+        may opt in: otherwise a saved-but-unpublished change (e.g. a halted
+        rollout that is still rolling out) would be reported as done.
 
         Args:
             package_name: App package name.
             edit_id: Edit ID to commit.
+            allow_not_sent_for_review: Retry with changesNotSentForReview=true
+                instead of raising when Play asks for it.
 
         Returns:
             True if the changes were sent for review/publishing, False if they
@@ -734,7 +788,7 @@ class PlayStoreClient:
                 service.edits().commit(packageName=package_name, editId=edit_id, **kwargs)
             )
         except HttpError as e:
-            if not self._is_not_sent_for_review_error(e):
+            if not allow_not_sent_for_review or not self._is_not_sent_for_review_error(e):
                 raise
             self._logger.warning(
                 "Play refused to send changes for review automatically; "
@@ -786,7 +840,7 @@ class PlayStoreClient:
                     body={"releases": [body]},
                 )
             )
-            return self._commit_edit(package_name, edit_id)
+            return self._commit_edit(package_name, edit_id, allow_not_sent_for_review=True)
 
         status = str(release_body.get("status", "completed"))
         try:
@@ -997,10 +1051,11 @@ class PlayStoreClient:
                           dict mapping language codes to release notes for multiple languages.
             release_notes_language: Language code for release notes (used only if release_notes is a string).
             rollout_percentage: Rollout percentage (0-100).
-            release_status: Optional explicit release status ("draft",
-                "completed", "inProgress", "halted"). Defaults to "completed",
-                or "inProgress" when rollout_percentage < 100. Apps that have
-                never been published automatically fall back to "draft".
+            release_status: Optional explicit release status: "draft",
+                "completed" (requires rollout 100) or "inProgress" (requires
+                rollout < 100). Defaults to "completed", or "inProgress" when
+                rollout_percentage < 100. Apps that have never been published
+                automatically fall back to "draft".
 
         Returns:
             Deployment result.
@@ -1012,6 +1067,15 @@ class PlayStoreClient:
             file_path=file_path,
             rollout_percentage=rollout_percentage,
         )
+
+        if problem := release_status_problem(release_status, rollout_percentage):
+            return DeploymentResult(
+                success=False,
+                package_name=package_name,
+                track=track,
+                message=problem,
+                error="InvalidInput",
+            )
 
         file_path_obj = Path(file_path)
         if not file_path_obj.exists():
@@ -4332,15 +4396,8 @@ class PlayStoreClient:
             service = self._get_service()
             edit_id = self._create_edit(package_name)
 
-            # Get current listing
-            try:
-                current_listing = self._execute(
-                    service.edits()
-                    .listings()
-                    .get(packageName=package_name, editId=edit_id, language=language)
-                )
-            except HttpError:
-                current_listing = {}
+            # Get current listing (404 = no listing in this language yet)
+            current_listing = self._get_listing_or_empty(package_name, edit_id, language)
 
             # Build update body with only provided fields
             update_body: dict[str, Any] = {}
@@ -4392,6 +4449,27 @@ class PlayStoreClient:
                 package_name=package_name,
                 language=language,
             )
+
+    def _get_listing_or_empty(
+        self, package_name: str, edit_id: str, language: str
+    ) -> dict[str, Any]:
+        """Return the listing for ``language`` in an edit, or {} if none exists yet.
+
+        Only a 404 means "no listing"; any other error is raised, so a failed
+        read never turns into an update that blanks the fields we didn't set.
+        """
+        service = self._get_service()
+        try:
+            result: dict[str, Any] = self._execute(
+                service.edits()
+                .listings()
+                .get(packageName=package_name, editId=edit_id, language=language)
+            )
+        except HttpError as e:
+            if getattr(getattr(e, "resp", None), "status", None) == 404:
+                return {}
+            raise
+        return result or {}
 
     def list_all_listings(self, package_name: str) -> list[Listing]:
         """List all store listings for all languages.
@@ -5378,39 +5456,54 @@ class PlayStoreClient:
                 )
             )
 
+            # The product now exists: from here on a failure is a partial
+            # success (reported in warnings), not "failed to create" -- a plain
+            # retry would otherwise hit AlreadyExists.
+            activated = False
+            warnings: list[str] = []
             if activate:
-                self._execute(
-                    service.monetization()
-                    .onetimeproducts()
-                    .purchaseOptions()
-                    .batchUpdateStates(
-                        packageName=package_name,
-                        productId=product_id,
-                        body={
-                            "requests": [
-                                {
-                                    "activatePurchaseOptionRequest": {
-                                        "packageName": package_name,
-                                        "productId": product_id,
-                                        "purchaseOptionId": purchase_option_id,
+                try:
+                    self._execute(
+                        service.monetization()
+                        .onetimeproducts()
+                        .purchaseOptions()
+                        .batchUpdateStates(
+                            packageName=package_name,
+                            productId=product_id,
+                            body={
+                                "requests": [
+                                    {
+                                        "activatePurchaseOptionRequest": {
+                                            "packageName": package_name,
+                                            "productId": product_id,
+                                            "purchaseOptionId": purchase_option_id,
+                                        }
                                     }
-                                }
-                            ]
-                        },
+                                ]
+                            },
+                        )
                     )
-                )
+                    activated = True
+                except Exception as e:
+                    warnings.append(
+                        f"Product was created but activating purchase option "
+                        f"{purchase_option_id} failed: {self._error_reason(e)}. Activate it with "
+                        "batch_update_purchase_option_states or in the Play Console."
+                    )
 
-            state = "active" if activate else "created (inactive)"
+            state = "active" if activated else "created (inactive)"
             return ProductSetupResult(
                 success=True,
                 message=(
                     f"One-time product {product_id} {state} at {format_money(money)} "
                     f"across {len(regional)} regions"
+                    + (f" (warning: {warnings[0]})" if warnings else "")
                 ),
                 base_price=format_money(money),
                 regions_version=version,
                 region_count=len(regional),
-                activated=activate,
+                activated=activated,
+                warnings=warnings,
                 **base,
             )
         except Exception as e:
@@ -5499,6 +5592,9 @@ class PlayStoreClient:
         extra_listings: dict[str, dict[str, Any]] | None = None,
         grace_period: str | None = None,
         activate: bool = True,
+        free_trial: str | None = None,
+        trial_eligibility: str = "new_customers",
+        trial_offer_id: str = "free-trial",
     ) -> ProductSetupResult:
         """Create an auto-renewing subscription priced in every region from one price.
 
@@ -5516,6 +5612,12 @@ class PlayStoreClient:
             extra_listings: Optional {language: {"title", "description", "benefits"}}.
             grace_period: Optional ISO 8601 grace period (P3D, P7D, P14D, P30D).
             activate: Activate the base plan so it can be purchased.
+            free_trial: Optional free period before the first charge, ISO 8601
+                (e.g. "P7D", "P1M"). Creates a free-trial offer on the base plan.
+            trial_eligibility: Who gets the trial: "new_customers" (never had
+                this subscription), "new_customers_any_subscription" (never had
+                any subscription in the app) or "developer_determined".
+            trial_offer_id: Offer ID for the free trial (default "free-trial").
 
         Returns:
             Result with the regions version and number of priced regions.
@@ -5547,6 +5649,8 @@ class PlayStoreClient:
                 )
             if benefits and len(benefits) > 4:
                 raise PlayStoreClientError("A subscription listing allows at most 4 benefits")
+            if free_trial is not None:
+                self._validate_trial(free_trial, trial_eligibility, trial_offer_id)
 
             money, conversion = self._convert_prices_raw(package_name, price, currency_code)
             regional, other = subscription_regional_configs(conversion)
@@ -5587,26 +5691,256 @@ class PlayStoreClient:
                     body=body,
                 )
             )
+            # The subscription now exists: later failures are partial successes
+            # reported in warnings (the subscription tool cannot overwrite, so a
+            # "failed" result would leave the user stuck on retry).
+            activated = False
+            warnings: list[str] = []
             if activate:
-                self.activate_base_plan(package_name, product_id, base_plan_id)
+                try:
+                    self.activate_base_plan(package_name, product_id, base_plan_id)
+                    activated = True
+                except Exception as e:
+                    warnings.append(
+                        f"Subscription was created but activating base plan {base_plan_id} "
+                        f"failed: {self._error_reason(e)}. Activate it with activate_base_plan "
+                        "or in the Play Console."
+                    )
 
-            state = "active" if activate else "created (inactive)"
+            trial_id: str | None = None
+            if free_trial is not None:
+                trial = self.create_free_trial_offer(
+                    package_name,
+                    product_id,
+                    base_plan_id,
+                    trial_duration=free_trial,
+                    offer_id=trial_offer_id,
+                    eligibility=trial_eligibility,
+                    activate=activated,
+                    regions_version=version,
+                    _region_codes=[c["regionCode"] for c in regional],
+                )
+                if trial.success:
+                    trial_id = trial.offer_id
+                    warnings.extend(trial.warnings)
+                else:
+                    warnings.append(
+                        f"Subscription was created but the free trial was not: {trial.message}. "
+                        "Retry with create_free_trial_offer."
+                    )
+
+            state = "active" if activated else "created (inactive)"
+            trial_text = (
+                f", with a {free_trial.strip().upper()} free trial"
+                if trial_id and free_trial
+                else ""
+            )
             return ProductSetupResult(
                 success=True,
                 message=(
                     f"Subscription {product_id} ({base_plan_id}, {period}) {state} at "
-                    f"{format_money(money)} across {len(regional)} regions"
+                    f"{format_money(money)} across {len(regional)} regions{trial_text}"
+                    + (f" (warning: {'; '.join(warnings)})" if warnings else "")
                 ),
                 base_price=format_money(money),
                 regions_version=version,
                 region_count=len(regional),
-                activated=activate,
+                activated=activated,
+                free_trial_offer_id=trial_id,
+                warnings=warnings,
                 **base,
             )
         except Exception as e:
             return self._fail_result(
                 ProductSetupResult,
                 f"Failed to create subscription {product_id}",
+                e,
+                **base,
+            )
+
+    @staticmethod
+    def _error_reason(error: BaseException) -> str:
+        """Short human-readable reason for an exception."""
+        return str(error.reason) if isinstance(error, HttpError) else str(error)
+
+    @staticmethod
+    def _validate_trial(trial_duration: str, eligibility: str, offer_id: str) -> None:
+        """Raise PlayStoreClientError if free-trial parameters are invalid."""
+        if not _TRIAL_DURATION_RE.fullmatch(trial_duration.strip().upper()):
+            raise PlayStoreClientError(
+                "free trial duration must be an ISO 8601 period such as P3D, P7D, P2W or P1M"
+            )
+        if eligibility not in _TRIAL_ELIGIBILITY:
+            raise PlayStoreClientError(
+                "trial eligibility must be one of: " + ", ".join(_TRIAL_ELIGIBILITY)
+            )
+        if not _OPTION_ID_RE.fullmatch(offer_id):
+            raise PlayStoreClientError(
+                "offer_id must be 1-63 lowercase letters, digits or '-', "
+                "starting with a letter or digit"
+            )
+
+    def _latest_regions_version(self, package_name: str) -> str:
+        """Ask Play for its current regions version (via a throwaway conversion)."""
+        try:
+            _, conversion = self._convert_prices_raw(package_name, "1", "USD")
+        except PlayStoreClientError:
+            self._logger.warning("Could not look up regions version; using default")
+            return DEFAULT_REGIONS_VERSION
+        return regions_version(conversion, DEFAULT_REGIONS_VERSION)
+
+    def create_free_trial_offer(
+        self,
+        package_name: str,
+        product_id: str,
+        base_plan_id: str,
+        trial_duration: str = "P1M",
+        offer_id: str = "free-trial",
+        eligibility: str = "new_customers",
+        activate: bool = True,
+        regions_version: str | None = None,
+        _region_codes: list[str] | None = None,
+    ) -> OfferSetupResult:
+        """Add a free-trial offer to a subscription base plan.
+
+        The offer is free for ``trial_duration``, then the base plan's normal
+        price is charged every period. It is made available in every region
+        the base plan is sold in, as Play requires.
+
+        Args:
+            package_name: App package name.
+            product_id: Subscription product ID.
+            base_plan_id: Base plan to attach the trial to.
+            trial_duration: Free period, ISO 8601 (e.g. "P7D", "P1M").
+            offer_id: Offer ID (lowercase letters, digits, '-').
+            eligibility: "new_customers" (never had this subscription),
+                "new_customers_any_subscription" (never had any subscription in
+                the app) or "developer_determined" (only when the app asks for
+                it via the offer ID/tags).
+            activate: Activate the offer (the base plan must already be active).
+            regions_version: Regions version; looked up from Play when omitted.
+
+        Returns:
+            Result with the offer ID, region count and activation state.
+        """
+        self._logger.info(
+            "Creating free trial offer",
+            package_name=package_name,
+            product_id=product_id,
+            base_plan_id=base_plan_id,
+        )
+        duration = trial_duration.strip().upper()
+        base: dict[str, Any] = {
+            "package_name": package_name,
+            "product_id": product_id,
+            "base_plan_id": base_plan_id,
+            "offer_id": offer_id,
+            "trial_duration": duration,
+            "eligibility": eligibility,
+        }
+        try:
+            self._validate_trial(duration, eligibility, offer_id)
+            service = self._get_service()
+
+            region_codes = _region_codes
+            if region_codes is None:
+                subscription = self._execute(
+                    service.monetization()
+                    .subscriptions()
+                    .get(packageName=package_name, productId=product_id)
+                )
+                plan = next(
+                    (
+                        bp
+                        for bp in subscription.get("basePlans", [])
+                        if bp.get("basePlanId") == base_plan_id
+                    ),
+                    None,
+                )
+                if plan is None:
+                    raise PlayStoreClientError(
+                        f"Base plan {base_plan_id} not found in subscription {product_id}"
+                    )
+                region_codes = [
+                    c["regionCode"] for c in plan.get("regionalConfigs", []) if c.get("regionCode")
+                ]
+            if not region_codes:
+                raise PlayStoreClientError(
+                    f"Base plan {base_plan_id} has no regional prices; set its prices first"
+                )
+            version = regions_version or self._latest_regions_version(package_name)
+
+            body: dict[str, Any] = {
+                "packageName": package_name,
+                "productId": product_id,
+                "basePlanId": base_plan_id,
+                "offerId": offer_id,
+                "phases": [
+                    {
+                        "recurrenceCount": 1,
+                        "duration": duration,
+                        "regionalConfigs": [
+                            {"regionCode": code, "free": {}} for code in region_codes
+                        ],
+                        "otherRegionsConfig": {"free": {}},
+                    }
+                ],
+                "regionalConfigs": [
+                    {"regionCode": code, "newSubscriberAvailability": True} for code in region_codes
+                ],
+                "otherRegionsConfig": {"otherRegionsNewSubscriberAvailability": True},
+            }
+            targeting = _TRIAL_ELIGIBILITY[eligibility]
+            if targeting is not None:
+                body["targeting"] = targeting
+
+            self._execute(
+                service.monetization()
+                .subscriptions()
+                .basePlans()
+                .offers()
+                .create(
+                    packageName=package_name,
+                    productId=product_id,
+                    basePlanId=base_plan_id,
+                    offerId=offer_id,
+                    regionsVersion_version=version,
+                    body=body,
+                )
+            )
+
+            activated = False
+            warnings: list[str] = []
+            if activate:
+                try:
+                    self.activate_subscription_offer(
+                        package_name, product_id, base_plan_id, offer_id
+                    )
+                    activated = True
+                except Exception as e:
+                    warnings.append(
+                        f"Free trial offer {offer_id} was created but activating it failed: "
+                        f"{self._error_reason(e)}. The base plan must be active first; then "
+                        "use activate_subscription_offer."
+                    )
+
+            state = "active" if activated else "created (inactive)"
+            return OfferSetupResult(
+                success=True,
+                message=(
+                    f"Free trial offer {offer_id} ({duration} free, then the {base_plan_id} "
+                    f"price) {state} in {len(region_codes)} regions"
+                    + (f" (warning: {warnings[0]})" if warnings else "")
+                ),
+                region_count=len(region_codes),
+                activated=activated,
+                warnings=warnings,
+                **base,
+            )
+        except Exception as e:
+            return self._fail_result(
+                OfferSetupResult,
+                f"Failed to create free trial offer {offer_id}",
                 e,
                 **base,
             )
@@ -5730,7 +6064,7 @@ class PlayStoreClient:
                 self._upload_image_to_edit(package_name, edit_id, language, image_type, path)
                 for path in image_paths
             ]
-            sent = self._commit_edit(package_name, edit_id)
+            sent = self._commit_edit(package_name, edit_id, allow_not_sent_for_review=True)
             return ImageBatchResult(
                 success=True,
                 message=(
@@ -5760,14 +6094,32 @@ class PlayStoreClient:
         ]
 
     def _scan_metadata_language(
-        self, lang_dir: Path
+        self, lang_dir: Path, problems: list[str], warnings: list[str]
     ) -> tuple[dict[str, str], dict[str, list[str]]]:
-        """Read text fields and image paths for one language directory."""
+        """Read text fields and image paths for one language directory.
+
+        Unreadable files/folders are appended to ``problems`` (they block the
+        sync); empty text files are skipped and noted in ``warnings`` so a
+        placeholder file never blanks a field on Play.
+        """
+        lang = lang_dir.name
         text: dict[str, str] = {}
         for filename, field in _LISTING_TEXT_FILES.items():
             file = lang_dir / filename
-            if file.is_file():
-                text[field] = file.read_text(encoding="utf-8").strip()
+            if not file.is_file():
+                continue
+            try:
+                value = file.read_text(encoding="utf-8").strip()
+            except UnicodeDecodeError:
+                problems.append(f"{lang}/{filename} is not UTF-8 text; re-save it as UTF-8")
+                continue
+            except OSError as e:
+                problems.append(f"{lang}/{filename} could not be read: {e.strerror or e}")
+                continue
+            if not value:
+                warnings.append(f"{lang}/{filename} is empty; left unchanged on Play")
+                continue
+            text[field] = value
 
         images: dict[str, list[str]] = {}
         images_dir = lang_dir / "images"
@@ -5783,10 +6135,17 @@ class PlayStoreClient:
             for image_type in sorted(_SCREENSHOT_TYPES):
                 sub = images_dir / image_type
                 if sub.is_dir():
+                    try:
+                        entries = list(sub.iterdir())
+                    except OSError as e:
+                        problems.append(
+                            f"{lang}/images/{image_type} could not be read: {e.strerror or e}"
+                        )
+                        continue
                     files = sorted(
                         (
                             p
-                            for p in sub.iterdir()
+                            for p in entries
                             if p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS
                         ),
                         key=self._natural_key,
@@ -5856,9 +6215,18 @@ class PlayStoreClient:
             )
 
         wanted = set(languages) if languages else None
+        try:
+            entries = list(root.iterdir())
+        except OSError as e:
+            return ListingSyncResult(
+                success=False,
+                message=f"Directory could not be read: {root}: {e.strerror or e}",
+                error="Unreadable",
+                **base,
+            )
         lang_dirs = sorted(
             p
-            for p in root.iterdir()
+            for p in entries
             if p.is_dir()
             and _LANGUAGE_DIR_RE.fullmatch(p.name)
             and (wanted is None or p.name in wanted)
@@ -5876,8 +6244,9 @@ class PlayStoreClient:
 
         plan: list[tuple[str, dict[str, str], dict[str, list[str]]]] = []
         problems: list[str] = []
+        warnings: list[str] = []
         for lang_dir in lang_dirs:
-            text, images = self._scan_metadata_language(lang_dir)
+            text, images = self._scan_metadata_language(lang_dir, problems, warnings)
             if not text and not images:
                 continue
             lang = lang_dir.name
@@ -5901,6 +6270,7 @@ class PlayStoreClient:
             )
             for lang, text, images in plan
         ]
+        base["warnings"] = warnings
 
         if problems:
             return ListingSyncResult(
@@ -5932,14 +6302,7 @@ class PlayStoreClient:
             edit_id = self._create_edit(package_name)
             for (lang, text, images), summary in zip(plan, summaries, strict=True):
                 if text:
-                    try:
-                        current = self._execute(
-                            service.edits()
-                            .listings()
-                            .get(packageName=package_name, editId=edit_id, language=lang)
-                        )
-                    except HttpError:
-                        current = {}
+                    current = self._get_listing_or_empty(package_name, edit_id, lang)
                     body = {
                         "title": current.get("title", ""),
                         "shortDescription": current.get("shortDescription", ""),
@@ -5965,7 +6328,7 @@ class PlayStoreClient:
                         )
                     for path in paths:
                         self._upload_image_to_edit(package_name, edit_id, lang, image_type, path)
-            sent = self._commit_edit(package_name, edit_id)
+            sent = self._commit_edit(package_name, edit_id, allow_not_sent_for_review=True)
             return ListingSyncResult(
                 success=True,
                 message=(
@@ -5985,6 +6348,7 @@ class PlayStoreClient:
                 package_name=package_name,
                 directory=str(root),
                 dry_run=dry_run,
+                warnings=warnings,
             )
             result.languages = summaries
             return result

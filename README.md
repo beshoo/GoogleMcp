@@ -250,7 +250,8 @@ Add to `.kiro/settings/mcp.json`:
 | `convert_region_prices` | Convert one price (e.g. `"4.99"` USD) to Play prices for every region (read-only) |
 | `create_one_time_product_with_price` | Create a one-time in-app product priced in every region from one price, and activate it |
 | `batch_create_one_time_products_with_price` | Create many priced one-time products; each distinct price is converted once |
-| `create_subscription_with_price` | Create an auto-renewing subscription + base plan priced in every region, and activate it |
+| `create_subscription_with_price` | Create an auto-renewing subscription + base plan priced in every region, and activate it. Optional `free_trial` (e.g. `"P1M"`) |
+| `create_free_trial_offer` | Add a free trial (e.g. 1 month free, then the normal price) to an existing subscription base plan |
 | `replace_listing_images` | Upload several screenshots/icon/feature graphic for one language in a single all-or-nothing commit |
 | `sync_listing_from_directory` | Sync listing text and images for every language from a fastlane-style folder (supports `dry_run`) |
 
@@ -260,10 +261,13 @@ Add to `.kiro/settings/mcp.json`:
   `draft` releases. The release is retried as a draft automatically, so the
   first upload of a new app works.
 - **`release_status`** on `deploy_app` — pass `"draft"` to stage a release
-  without rolling it out.
-- **Review fallback** — when Play refuses to send changes for review
-  automatically, the commit is retried with `changesNotSentForReview=true` and
-  the result tells you to send them for review from the Play Console.
+  without rolling it out. A status that contradicts `rollout_percentage`
+  (e.g. `completed` with a 5% rollout) is rejected.
+- **Review fallback** — for deploys, promotions, image replacement and listing
+  sync, when Play refuses to send changes for review automatically the commit
+  is retried with `changesNotSentForReview=true` and the result tells you to
+  send them for review from the Play Console. Other tools still report the
+  error.
 
 #### Listing folder layout
 
@@ -294,6 +298,8 @@ applied in one commit; use `dry_run=true` to preview.
 
 - *"Create a consumable `coins_500` called '500 Coins' for $1.99 in com.example.app."*
 - *"Create a monthly subscription `premium` at $4.99 with benefits 'No ads' and 'Cloud sync'."*
+- *"Create a monthly subscription `premium` at $4.99 with the first month free for new customers."*
+- *"Add a 7-day free trial to the `monthly` plan of `premium`."*
 - *"Dry-run a listing sync from ./fastlane/metadata/android, then apply it."*
 - *"Replace the en-US phone screenshots with the PNGs in ./shots."*
 

@@ -134,8 +134,37 @@ class TestCommitFallbacks:
             ),
             {},
         ]
-        assert client._commit_edit(PKG, "edit-1") is False
+        assert client._commit_edit(PKG, "edit-1", allow_not_sent_for_review=True) is False
         assert commit.call_args_list[-1].kwargs["changesNotSentForReview"] is True
+
+    def test_commit_does_not_retry_unless_opted_in(
+        self, client: PlayStoreClient, _mock_service: MagicMock
+    ) -> None:
+        """Callers that can't report 'saved but not sent' must still see the error."""
+        commit = _mock_service.edits.return_value.commit
+        commit.return_value.execute.side_effect = _http_error(
+            400, "Please set the query parameter changesNotSentForReview to true."
+        )
+        with pytest.raises(HttpError):
+            client._commit_edit(PKG, "edit-1")
+        assert commit.call_count == 1
+
+    def test_halt_release_reports_failure_not_silent_save(
+        self, client: PlayStoreClient, _mock_service: MagicMock
+    ) -> None:
+        edits = _mock_service.edits.return_value
+        edits.insert.return_value.execute.return_value = {"id": "edit-1"}
+        edits.tracks.return_value.get.return_value.execute.return_value = {
+            "track": "production",
+            "releases": [{"versionCodes": ["5"], "status": "inProgress", "userFraction": 0.1}],
+        }
+        edits.tracks.return_value.update.return_value.execute.return_value = {}
+        edits.commit.return_value.execute.side_effect = _http_error(
+            400, "Please set the query parameter changesNotSentForReview to true."
+        )
+        result = client.halt_release(PKG, "production", 5)
+        assert result.success is False
+        assert edits.commit.call_count == 1
 
     def test_commit_reraises_other_errors(
         self, client: PlayStoreClient, _mock_service: MagicMock
@@ -168,6 +197,24 @@ class TestCommitFallbacks:
         commit.return_value.execute.return_value = {}
         client._commit_edit(PKG, "edit-1")
         assert commit.call_args.kwargs["changesInReviewBehavior"] == expected
+
+    def test_in_review_behavior_accepts_api_value(
+        self, client: PlayStoreClient, _mock_service: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR", "error_if_in_review")
+        commit = _mock_service.edits.return_value.commit
+        commit.return_value.execute.return_value = {}
+        client._commit_edit(PKG, "edit-1")
+        assert commit.call_args.kwargs["changesInReviewBehavior"] == "ERROR_IF_IN_REVIEW"
+
+    def test_in_review_behavior_unknown_value_is_ignored(
+        self, client: PlayStoreClient, _mock_service: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR", "refuse")
+        commit = _mock_service.edits.return_value.commit
+        commit.return_value.execute.return_value = {}
+        client._commit_edit(PKG, "edit-1")
+        assert "changesInReviewBehavior" not in commit.call_args.kwargs
 
     def test_in_review_behavior_unset_sends_nothing(
         self, client: PlayStoreClient, _mock_service: MagicMock, monkeypatch: pytest.MonkeyPatch
@@ -233,6 +280,46 @@ class TestDraftAppFallback:
         assert result.success is False
         assert edits.tracks.return_value.update.call_count == 1
         edits.delete.assert_called()
+
+    @pytest.mark.parametrize(
+        ("status", "rollout", "fragment"),
+        [
+            ("completed", 5.0, "100% of users"),
+            ("inProgress", 100.0, "below 100"),
+            ("halted", 100.0, "must be one of"),
+            ("live", 100.0, "must be one of"),
+        ],
+    )
+    def test_conflicting_release_status_rejected(
+        self,
+        client: PlayStoreClient,
+        edits: MagicMock,
+        tmp_path: Any,
+        status: str,
+        rollout: float,
+        fragment: str,
+    ) -> None:
+        aab = tmp_path / "app.aab"
+        aab.write_bytes(b"aab")
+        result = client.deploy_app(
+            PKG, "production", str(aab), rollout_percentage=rollout, release_status=status
+        )
+        assert result.success is False
+        assert fragment in result.message
+        edits.insert.assert_not_called()
+
+    def test_in_progress_with_partial_rollout(
+        self, client: PlayStoreClient, edits: MagicMock, tmp_path: Any
+    ) -> None:
+        aab = tmp_path / "app.aab"
+        aab.write_bytes(b"aab")
+        edits.tracks.return_value.update.return_value.execute.return_value = {}
+        result = client.deploy_app(
+            PKG, "production", str(aab), rollout_percentage=10.0, release_status="inProgress"
+        )
+        assert result.success is True
+        release = edits.tracks.return_value.update.call_args.kwargs["body"]["releases"][0]
+        assert release["userFraction"] == pytest.approx(0.1)
 
     def test_explicit_draft_status(
         self, client: PlayStoreClient, edits: MagicMock, tmp_path: Any
@@ -344,6 +431,18 @@ class TestOneTimeProductWithPrice:
         otp.get.assert_not_called()
         otp.purchaseOptions.return_value.batchUpdateStates.assert_not_called()
 
+    def test_activation_failure_is_partial_success(
+        self, client: PlayStoreClient, otp: MagicMock
+    ) -> None:
+        otp.purchaseOptions.return_value.batchUpdateStates.return_value.execute.side_effect = (
+            _http_error(400, "Missing tax category")
+        )
+        result = client.create_one_time_product_with_price(PKG, "coins_100", "t", "d", "1")
+        assert result.success is True
+        assert result.activated is False
+        assert "Missing tax category" in result.warnings[0]
+        assert "warning" in result.message
+
     @pytest.mark.parametrize("bad_id", ["Coins", "_coins", "coins-100", ""])
     def test_invalid_product_id(self, client: PlayStoreClient, otp: MagicMock, bad_id: str) -> None:
         result = client.create_one_time_product_with_price(PKG, bad_id, "t", "d", "1")
@@ -404,10 +503,73 @@ class TestSubscriptionWithPrice:
         assert kwargs["body"]["listings"][0]["benefits"] == ["No ads", "Cloud sync"]
         subs.basePlans.return_value.activate.assert_called_once()
 
+    def test_activation_failure_is_partial_success(
+        self, client: PlayStoreClient, subs: MagicMock
+    ) -> None:
+        subs.basePlans.return_value.activate.return_value.execute.side_effect = _http_error(
+            400, "Base plan incomplete"
+        )
+        result = client.create_subscription_with_price(PKG, "premium", "Premium", "4.99")
+        assert result.success is True
+        assert result.activated is False
+        assert "Base plan incomplete" in result.warnings[0]
+
+    def test_with_one_month_free_trial(self, client: PlayStoreClient, subs: MagicMock) -> None:
+        offers = subs.basePlans.return_value.offers.return_value
+        offers.create.return_value.execute.return_value = {}
+        offers.activate.return_value.execute.return_value = {}
+
+        result = client.create_subscription_with_price(
+            PKG, "premium", "Premium", "4.99", free_trial="p1m"
+        )
+
+        assert result.success is True, result.message
+        assert result.free_trial_offer_id == "free-trial"
+        assert result.warnings == []
+        assert "P1M free trial" in result.message
+        kwargs = offers.create.call_args.kwargs
+        assert kwargs["basePlanId"] == "monthly"
+        assert kwargs["regionsVersion_version"] == "2025/03"
+        body = kwargs["body"]
+        phase = body["phases"][0]
+        assert phase["duration"] == "P1M"
+        assert phase["recurrenceCount"] == 1
+        assert {c["regionCode"] for c in phase["regionalConfigs"]} == {"DE", "US"}
+        assert all(c["free"] == {} for c in phase["regionalConfigs"])
+        assert phase["otherRegionsConfig"] == {"free": {}}
+        assert {c["regionCode"] for c in body["regionalConfigs"]} == {"DE", "US"}
+        assert body["targeting"] == {"acquisitionRule": {"scope": {"thisSubscription": {}}}}
+        offers.activate.assert_called_once()
+
+    def test_trial_failure_keeps_subscription(
+        self, client: PlayStoreClient, subs: MagicMock
+    ) -> None:
+        offers = subs.basePlans.return_value.offers.return_value
+        offers.create.return_value.execute.side_effect = _http_error(400, "Offer rejected")
+        result = client.create_subscription_with_price(
+            PKG, "premium", "Premium", "4.99", free_trial="P1M"
+        )
+        assert result.success is True
+        assert result.free_trial_offer_id is None
+        assert any("create_free_trial_offer" in w for w in result.warnings)
+
+    def test_trial_not_activated_when_base_plan_inactive(
+        self, client: PlayStoreClient, subs: MagicMock
+    ) -> None:
+        offers = subs.basePlans.return_value.offers.return_value
+        offers.create.return_value.execute.return_value = {}
+        result = client.create_subscription_with_price(
+            PKG, "premium", "Premium", "4.99", free_trial="P7D", activate=False
+        )
+        assert result.success is True
+        assert result.free_trial_offer_id == "free-trial"
+        offers.activate.assert_not_called()
+
     @pytest.mark.parametrize(
         ("kwargs", "fragment"),
         [
-            ({"billing_period": "P2D"}, "billing_period"),
+            ({"free_trial": "1 month"}, "ISO 8601"),
+            ({"free_trial": "P1M", "trial_eligibility": "everyone"}, "eligibility"),
             ({"base_plan_id": "Monthly"}, "base_plan_id"),
             ({"benefits": ["1", "2", "3", "4", "5"]}, "benefits"),
         ],
@@ -419,6 +581,68 @@ class TestSubscriptionWithPrice:
         assert result.success is False
         assert fragment in result.message
         subs.create.assert_not_called()
+
+
+class TestFreeTrialOffer:
+    @pytest.fixture
+    def subs(self, monetization: MagicMock) -> MagicMock:
+        subs = monetization.subscriptions.return_value
+        subs.get.return_value.execute.return_value = {
+            "productId": "premium",
+            "basePlans": [
+                {
+                    "basePlanId": "monthly",
+                    "regionalConfigs": [{"regionCode": "US"}, {"regionCode": "FR"}],
+                }
+            ],
+        }
+        offers = subs.basePlans.return_value.offers.return_value
+        offers.create.return_value.execute.return_value = {}
+        offers.activate.return_value.execute.return_value = {}
+        return subs
+
+    def test_adds_trial_to_existing_plan(
+        self, client: PlayStoreClient, subs: MagicMock, monetization: MagicMock
+    ) -> None:
+        result = client.create_free_trial_offer(
+            PKG, "premium", "monthly", eligibility="new_customers_any_subscription"
+        )
+        assert result.success is True, result.message
+        assert result.region_count == 2
+        assert result.activated is True
+        body = subs.basePlans.return_value.offers.return_value.create.call_args.kwargs["body"]
+        assert body["phases"][0]["duration"] == "P1M"
+        assert body["targeting"]["acquisitionRule"]["scope"] == {"anySubscriptionInApp": {}}
+        # regions version looked up from Play when not given
+        assert monetization.convertRegionPrices.call_count == 1
+        kwargs = subs.basePlans.return_value.offers.return_value.create.call_args.kwargs
+        assert kwargs["regionsVersion_version"] == "2025/03"
+
+    def test_developer_determined_has_no_targeting(
+        self, client: PlayStoreClient, subs: MagicMock
+    ) -> None:
+        result = client.create_free_trial_offer(
+            PKG, "premium", "monthly", "P7D", eligibility="developer_determined"
+        )
+        assert result.success is True
+        body = subs.basePlans.return_value.offers.return_value.create.call_args.kwargs["body"]
+        assert "targeting" not in body
+
+    def test_unknown_base_plan(self, client: PlayStoreClient, subs: MagicMock) -> None:
+        result = client.create_free_trial_offer(PKG, "premium", "yearly")
+        assert result.success is False
+        assert "yearly not found" in result.message
+        subs.basePlans.return_value.offers.return_value.create.assert_not_called()
+
+    def test_activation_failure_is_partial_success(
+        self, client: PlayStoreClient, subs: MagicMock
+    ) -> None:
+        offers = subs.basePlans.return_value.offers.return_value
+        offers.activate.return_value.execute.side_effect = _http_error(400, "Plan inactive")
+        result = client.create_free_trial_offer(PKG, "premium", "monthly")
+        assert result.success is True
+        assert result.activated is False
+        assert "Plan inactive" in result.warnings[0]
 
 
 # =========================================================================
@@ -616,6 +840,48 @@ class TestListingSync:
         assert any("en-US" in p and "30" in p for p in result.problems)
         image_edits.insert.assert_not_called()
 
+    def test_listing_read_error_does_not_blank_fields(
+        self, client: PlayStoreClient, image_edits: MagicMock, metadata: Any
+    ) -> None:
+        image_edits.listings.return_value.get.return_value.execute.side_effect = _http_error(
+            403, "Forbidden"
+        )
+        result = client.sync_listing_from_directory(PKG, str(metadata))
+        assert result.success is False
+        image_edits.listings.return_value.update.assert_not_called()
+        image_edits.commit.assert_not_called()
+
+    def test_new_language_404_starts_empty(
+        self, client: PlayStoreClient, image_edits: MagicMock, metadata: Any
+    ) -> None:
+        image_edits.listings.return_value.get.return_value.execute.side_effect = _http_error(
+            404, "Not found"
+        )
+        result = client.sync_listing_from_directory(PKG, str(metadata), languages=["en-US"])
+        assert result.success is True, result.message
+        body = image_edits.listings.return_value.update.call_args.kwargs["body"]
+        assert body["title"] == "My App"
+        assert body["fullDescription"] == ""
+
+    def test_empty_file_is_skipped_with_warning(
+        self, client: PlayStoreClient, image_edits: MagicMock, metadata: Any
+    ) -> None:
+        (metadata / "en-US" / "title.txt").write_text("  \n", encoding="utf-8")
+        result = client.sync_listing_from_directory(PKG, str(metadata), languages=["en-US"])
+        assert result.success is True, result.message
+        assert any("title.txt is empty" in w for w in result.warnings)
+        body = image_edits.listings.return_value.update.call_args.kwargs["body"]
+        assert body["title"] == "Old title"
+
+    def test_non_utf8_file_is_a_problem(
+        self, client: PlayStoreClient, image_edits: MagicMock, metadata: Any
+    ) -> None:
+        (metadata / "de-DE" / "full_description.txt").write_bytes("Größe".encode("utf-16"))
+        result = client.sync_listing_from_directory(PKG, str(metadata))
+        assert result.success is False
+        assert any("de-DE/full_description.txt is not UTF-8" in p for p in result.problems)
+        image_edits.insert.assert_not_called()
+
     def test_missing_directory(self, client: PlayStoreClient, tmp_path: Any) -> None:
         result = client.sync_listing_from_directory(PKG, str(tmp_path / "nope"))
         assert result.success is False
@@ -664,6 +930,7 @@ class TestWorkflowTools:
             ("create_subscription_with_price", (PKG, "x", "t", "1")),
             ("replace_listing_images", (PKG, "en-US", "icon", ["/a.png"])),
             ("sync_listing_from_directory", (PKG, "/meta")),
+            ("create_free_trial_offer", (PKG, "premium", "monthly")),
         ],
     )
     def test_writes_blocked_in_read_only(
@@ -689,6 +956,32 @@ class TestWorkflowTools:
         )
         assert server.convert_region_prices(PKG, "1")["regions_version"] == "2025/03"
 
+    @pytest.mark.asyncio
+    async def test_price_accepts_json_number(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fastmcp import Client
+
+        # The in-memory client runs the lifespan, which resets the shared client.
+        monkeypatch.setattr(server, "get_client_from_context", lambda: self.mock)
+
+        self.mock.convert_region_prices.return_value = RegionalPriceConversion(
+            package_name=PKG, base_price="0.99 USD", regions_version="2025/03"
+        )
+        async with Client(server.mcp) as c:
+            result = await c.call_tool(
+                "convert_region_prices", {"package_name": PKG, "price": 0.99}
+            )
+        assert not result.is_error
+        assert self.mock.convert_region_prices.call_args.args[1] == 0.99
+
+    def test_deploy_rejects_conflicting_release_status(self, tmp_path: Any) -> None:
+        aab = tmp_path / "app.aab"
+        aab.write_bytes(b"aab")
+        result = server.deploy_app(
+            PKG, "production", str(aab), rollout_percentage=5.0, release_status="completed"
+        )
+        assert "100% of users" in result["error"]
+        self.mock.deploy_app.assert_not_called()
+
     def test_deploy_rejects_bad_release_status(self, tmp_path: Any) -> None:
         aab = tmp_path / "app.aab"
         aab.write_bytes(b"aab")
@@ -709,3 +1002,19 @@ class TestWorkflowTools:
         kwargs = self.mock.create_subscription_with_price.call_args.kwargs
         assert kwargs["billing_period"] == "P1M"
         assert kwargs["base_plan_id"] == "monthly"
+        assert kwargs["free_trial"] is None
+
+    def test_create_free_trial_offer_tool_forwards(self) -> None:
+        from play_store_mcp.models import OfferSetupResult
+
+        self.mock.create_free_trial_offer.return_value = OfferSetupResult(
+            success=True,
+            message="ok",
+            package_name=PKG,
+            product_id="premium",
+            base_plan_id="monthly",
+            offer_id="free-trial",
+        )
+        result = server.create_free_trial_offer(PKG, "premium", "monthly", trial_duration="P1M")
+        assert result["success"] is True
+        assert self.mock.create_free_trial_offer.call_args.kwargs["trial_duration"] == "P1M"

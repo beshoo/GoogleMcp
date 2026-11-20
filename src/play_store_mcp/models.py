@@ -598,6 +598,32 @@ class ProductSetupResult(OperationResult):
     option_id: str | None = Field(
         None, description="Purchase option ID (one-time) or base plan ID (subscription)"
     )
+    free_trial_offer_id: str | None = Field(
+        None, description="ID of the free-trial offer created with the subscription, if any"
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Follow-up needed after a partial success, e.g. the product was created but "
+            "activation failed"
+        ),
+    )
+
+
+class OfferSetupResult(OperationResult):
+    """Result of creating a subscription free-trial offer."""
+
+    package_name: str = Field(..., description=_DESC_PACKAGE_NAME)
+    product_id: str = Field(..., description="Subscription product ID")
+    base_plan_id: str = Field(..., description="Base plan the offer extends")
+    offer_id: str = Field(..., description="Offer ID")
+    trial_duration: str | None = Field(None, description="Free period, ISO 8601 (e.g. P1M)")
+    eligibility: str | None = Field(None, description="Who can redeem the offer")
+    region_count: int = Field(0, description="Number of regions the offer is available in")
+    activated: bool = Field(False, description="Whether the offer was activated")
+    warnings: list[str] = Field(
+        default_factory=list, description="Follow-up needed after a partial success"
+    )
 
 
 class BatchProductSetupResult(BaseModel):
@@ -655,6 +681,10 @@ class ListingSyncResult(OperationResult):
     )
     problems: list[str] = Field(
         default_factory=list, description="Validation problems that blocked the sync"
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Non-blocking notes, e.g. empty text files that were left unchanged",
     )
     sent_for_review: bool | None = Field(
         None,

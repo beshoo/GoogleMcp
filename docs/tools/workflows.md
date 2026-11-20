@@ -80,6 +80,36 @@ with `create_subscription_offer`.
 | `extra_listings` | object | No | — | Translations (`title`, `description`, `benefits`) |
 | `grace_period` | string | No | — | `P3D`, `P7D`, `P14D`, `P30D` |
 | `activate` | bool | No | `true` | Activate the base plan |
+| `free_trial` | string | No | — | Free period before the first charge, e.g. `P7D`, `P1M` |
+| `trial_eligibility` | string | No | `new_customers` | `new_customers`, `new_customers_any_subscription`, `developer_determined` |
+
+If activation or the free trial fails after the subscription was created, the
+result is still `success: true` with `activated: false` and the follow-up step
+in `warnings`, because the subscription exists and a plain retry would fail.
+
+```python
+# 1 month free, then $4.99 every month
+create_subscription_with_price(
+    "com.example.myapp", "premium", "Premium", "4.99", free_trial="P1M",
+    benefits=["No ads", "Cloud sync"],
+)
+```
+
+### create_free_trial_offer
+
+Add a free trial to an existing base plan: free for `trial_duration`, then the
+base plan's normal price every period. The offer is enabled in every region
+the base plan is sold in.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `package_name` | string | Yes | — | App package name |
+| `product_id` | string | Yes | — | Subscription ID |
+| `base_plan_id` | string | Yes | — | Base plan to extend (must be active to activate the offer) |
+| `trial_duration` | string | No | `P1M` | ISO 8601 period: `P3D`, `P7D`, `P2W`, `P1M`, ... |
+| `offer_id` | string | No | `free-trial` | Offer ID |
+| `eligibility` | string | No | `new_customers` | `new_customers` (never had this subscription), `new_customers_any_subscription` (never had any subscription in the app), `developer_determined` (only when the app requests the offer) |
+| `activate` | bool | No | `true` | Activate the offer |
 
 ---
 
@@ -119,8 +149,10 @@ Sync listing text and images for every language from a folder in the fastlane
 | `replace_images` | bool | No | `true` | Make Play's images match the folder exactly |
 | `dry_run` | bool | No | `false` | Validate and report without changing anything (allowed in read-only mode) |
 
-Only what exists in the folder is changed. Text limits and image counts are
-validated before anything is sent, and everything is applied in one commit.
+Only what exists in the folder is changed. Empty text files are skipped (and
+listed in `warnings`), unreadable or non-UTF-8 files are reported in
+`problems`, and text limits and image counts are validated before anything is
+sent. Everything is applied in one commit.
 
 ---
 
@@ -131,10 +163,13 @@ Every edit-based tool commits through the same helper:
 - **Draft apps.** An app that has never been published only accepts `draft`
   releases. `deploy_app` and `promote_release` retry the release as a draft
   in the same edit, and say so in the result.
-- **Changes not sent for review.** When Play refuses to send changes for
-  review automatically, the commit is retried with
-  `changesNotSentForReview=true`. The changes are saved; send them for review
-  from the Play Console.
+- **Changes not sent for review.** For deploys, promotions,
+  `replace_listing_images` and `sync_listing_from_directory`, when Play refuses
+  to send changes for review automatically the commit is retried with
+  `changesNotSentForReview=true` and the result says so. The changes are
+  saved; send them for review from the Play Console. Other tools (halting a
+  rollout, single listing updates, ...) report the error instead, so a change
+  that didn't go live is never reported as done.
 - **Changes already in review.** By default Google cancels an in-progress
   review when you commit. Set `PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR=error` to
   make commits fail instead, or `cancel` to keep Google's default explicitly.
