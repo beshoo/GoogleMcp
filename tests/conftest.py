@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 # CODE_MODE now defaults to enabled, but the module-level `mcp` singleton in
 # server.py is built once at import time from whatever CODE_MODE is in the
-# environment at that moment — most of this suite (and the "117 tools"
+# environment at that moment — most of this suite (and the "123 tools"
 # classic-surface assertion) exercises that singleton directly, so pin it to
 # the classic tool list here. Must run before ANY `play_store_mcp` import
 # below (even `play_store_mcp.client`), since `play_store_mcp/__init__.py`

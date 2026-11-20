@@ -1237,10 +1237,15 @@ class TestBoundaryValues:
         body = update_call.kwargs["body"]
         assert body["releases"][0]["status"] == "completed"
 
-    def test_validate_listing_text_exactly_50_chars(self, client: PlayStoreClient) -> None:
-        """Test title at exactly 50 characters (valid)."""
-        errors = client.validate_listing_text(title="A" * 50)
+    def test_validate_listing_text_exactly_30_chars(self, client: PlayStoreClient) -> None:
+        """Test title at exactly 30 characters (Google Play's app-name limit, valid)."""
+        errors = client.validate_listing_text(title="A" * 30)
         assert len(errors) == 0
+
+    def test_validate_listing_text_31_chars_rejected(self, client: PlayStoreClient) -> None:
+        """Test title at 31 characters is rejected (Google Play caps app names at 30)."""
+        errors = client.validate_listing_text(title="A" * 31)
+        assert [e.field for e in errors] == ["title"]
 
     def test_validate_listing_text_exactly_80_chars(self, client: PlayStoreClient) -> None:
         """Test short_description at exactly 80 characters (valid)."""

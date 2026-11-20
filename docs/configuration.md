@@ -92,6 +92,7 @@ docker run -p 8000:8000 \
 | `PLAY_STORE_MCP_DISABLE_DNS_REBINDING` | Disable DNS rebinding protection (for cloud/reverse-proxy deployments) | No | — |
 | `PLAY_STORE_MCP_ADMIN_TOKEN` | Require `Authorization: Bearer <token>` on the `/credentials` endpoint (needed behind a reverse proxy, where the localhost check is insufficient) | No | — |
 | `PLAY_STORE_MCP_READ_ONLY` | Disable all write operations | No | — |
+| `PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR` | `error` = fail a commit instead of cancelling a review already in progress; `cancel` = Google's default | No | Google default (cancel) |
 | `PLAY_STORE_MCP_DOWNLOAD_DIR` | Directory that APK/AAB downloads are confined to (guards against path traversal / arbitrary-file overwrite). Downloads are **always** confined; a destination outside this directory is rejected. **Recommended** for network/hosted deployments (`sse`/`streamable-http`) — the server warns if it is unset and falls back to the working directory, which may be read-only on some hosts (e.g. set it to `/tmp/play-store-downloads` on Render). | No (defaults to cwd) | cwd |
 | `CODE_MODE` | Set to `0` to opt out of the code-mode transform and use the classic tool list | No | on |
 | `PLAY_STORE_MCP_FAILURE_LOG` | Set to `1` to record failed tool calls to a JSON-lines file (see [Tool-Failure Log](#tool-failure-log)) | No | off |

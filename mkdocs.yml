@@ -59,6 +59,7 @@ nav:
       - Testers: tools/testers.md
       - Batch Operations: tools/batch.md
       - Validation: tools/validation.md
+      - Workflows: tools/workflows.md
   - Remote Credentials: remote-credentials.md
   - Troubleshooting: troubleshooting.md
   - Changelog: changelog.md

@@ -142,6 +142,10 @@ def _validate_deploy_file(file_path: str) -> str | None:
     return None
 
 
+# Release statuses deploy_app accepts as an explicit override.
+_RELEASE_STATUSES = frozenset({"draft", "completed", "inProgress", "halted"})
+
+
 def _validate_rollout(pct: float) -> str | None:
     """Return error message if rollout percentage is invalid, None if valid."""
     if not (0.0 <= pct <= 100.0):
@@ -198,7 +202,7 @@ def _build_transforms() -> list[Any]:
     Default: the tool surface is wrapped in the experimental CodeMode transform
     (search/get_schema/execute meta-tools + sandboxed execution), which cuts
     per-request tool-list overhead. Set CODE_MODE=0 to opt out and expose the
-    classic 117-tool surface instead.
+    classic 123-tool surface instead.
     """
     if not _code_mode_enabled():
         return []
@@ -238,6 +242,7 @@ def deploy_app(
     release_notes: str | None = None,
     release_notes_language: str = "en-US",
     rollout_percentage: float = 100.0,
+    release_status: str | None = None,
 ) -> dict[str, Any]:
     """Deploy an APK or AAB file to a Play Store track.
 
@@ -249,6 +254,10 @@ def deploy_app(
                       or use release_notes_multilang for multiple languages)
         release_notes_language: Language code for release notes (default: en-US)
         rollout_percentage: Rollout percentage (0-100). Default 100 for full rollout.
+        release_status: Optional release status: draft, completed, inProgress or
+            halted. Default is completed (inProgress when rollout < 100). Use
+            "draft" to stage a release without rolling it out. Apps that have
+            never been published are automatically uploaded as a draft.
 
     Returns:
         Deployment result with success status and details
@@ -259,6 +268,8 @@ def deploy_app(
         return {"error": err}
     if err := _validate_rollout(rollout_percentage):
         return {"error": err}
+    if release_status is not None and release_status not in _RELEASE_STATUSES:
+        return {"error": "release_status must be one of: draft, completed, inProgress, halted"}
 
     client = get_client_from_context()
 
@@ -269,6 +280,7 @@ def deploy_app(
         release_notes=release_notes,
         release_notes_language=release_notes_language,
         rollout_percentage=rollout_percentage,
+        release_status=release_status,
     )
 
     return result.model_dump()
@@ -2301,7 +2313,7 @@ def update_listing(
     Args:
         package_name: App package name
         language: Language code (e.g., en-US, es-ES, fr-FR)
-        title: App title (max 50 characters, optional)
+        title: App title (max 30 characters, optional)
         full_description: Full description (max 4000 characters, optional)
         short_description: Short description (max 80 characters, optional)
         video: YouTube video URL (optional)
@@ -3466,7 +3478,7 @@ def validate_listing_text(
     """Validate store listing text lengths before updating.
 
     Args:
-        title: App title (max 50 characters)
+        title: App title (max 30 characters)
         short_description: Short description (max 80 characters)
         full_description: Full description (max 4000 characters)
 
@@ -3591,6 +3603,276 @@ def upload_internal_app_sharing_bundle(
         bundle_path=bundle_path,
     )
     return artifact.model_dump()
+
+
+# =============================================================================
+# Workflow Tools (regional pricing, priced products, image batches, listing sync)
+# =============================================================================
+
+
+@mcp.tool()
+def convert_region_prices(
+    package_name: str, price: str, currency_code: str = "USD"
+) -> dict[str, Any]:
+    """Convert one price into Google Play prices for every billable region.
+
+    Uses Play's own exchange rates and local price rounding, the same
+    conversion the Play Console applies. Read-only; nothing is changed.
+
+    Args:
+        package_name: App package name
+        price: Base price in major units, e.g. "4.99"
+        currency_code: ISO 4217 currency of the price (default USD)
+
+    Returns:
+        Region code to converted (tax-inclusive) price, the regions version, and
+        the USD/EUR prices used for regions Play may add later
+    """
+    client = get_client_from_context()
+    return client.convert_region_prices(package_name, price, currency_code).model_dump()
+
+
+@mcp.tool()
+def create_one_time_product_with_price(
+    package_name: str,
+    product_id: str,
+    title: str,
+    description: str,
+    price: str,
+    currency_code: str = "USD",
+    language: str = "en-US",
+    extra_listings: dict[str, dict[str, str]] | None = None,
+    purchase_option_id: str = "default",
+    activate: bool = True,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Create a one-time in-app product (consumable or not) priced in every region.
+
+    One price (e.g. "0.99" USD) is converted to every region with Play's
+    regional pricing, the product is created with a single legacy-compatible
+    buy option, and the option is activated so it can be purchased right away.
+    Disabled in read-only mode.
+
+    Args:
+        package_name: App package name
+        product_id: Product ID - lowercase letters, digits, '_' and '.', starting
+            with a letter or digit (e.g. "coins_100")
+        title: Product title in `language`
+        description: Product description in `language`
+        price: Base price in major units, e.g. "0.99"
+        currency_code: Currency of `price` (default USD)
+        language: BCP-47 language of title/description (default en-US)
+        extra_listings: Optional translations, e.g.
+            {"de-DE": {"title": "100 Münzen", "description": "..."}}
+        purchase_option_id: Purchase option ID (default "default")
+        activate: Activate the purchase option (default true)
+        overwrite: Replace an existing product with the same ID (default false)
+
+    Returns:
+        Result with base price, regions version and number of priced regions
+    """
+    if blocked := _read_only_block("create_one_time_product_with_price"):
+        return blocked
+    client = get_client_from_context()
+    return client.create_one_time_product_with_price(
+        package_name=package_name,
+        product_id=product_id,
+        title=title,
+        description=description,
+        price=price,
+        currency_code=currency_code,
+        language=language,
+        extra_listings=extra_listings,
+        purchase_option_id=purchase_option_id,
+        activate=activate,
+        overwrite=overwrite,
+    ).model_dump()
+
+
+@mcp.tool()
+def batch_create_one_time_products_with_price(
+    package_name: str,
+    products: list[dict[str, Any]],
+    activate: bool = True,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Create several priced one-time in-app products at once.
+
+    Each distinct price is converted to regional prices only once. A failing
+    product does not stop the others. Disabled in read-only mode.
+
+    Args:
+        package_name: App package name
+        products: List of products, each with product_id, title, description,
+            price and optionally currency_code, language, extra_listings,
+            purchase_option_id. Example:
+            [{"product_id": "coins_100", "title": "100 Coins",
+              "description": "A pile of coins", "price": "0.99"}]
+        activate: Activate each product's purchase option (default true)
+        overwrite: Replace products that already exist (default false)
+
+    Returns:
+        Totals plus a result per product, in input order
+    """
+    if blocked := _read_only_block("batch_create_one_time_products_with_price"):
+        return blocked
+    client = get_client_from_context()
+    return client.batch_create_one_time_products_with_price(
+        package_name=package_name,
+        products=products,
+        activate=activate,
+        overwrite=overwrite,
+    ).model_dump()
+
+
+@mcp.tool()
+def create_subscription_with_price(
+    package_name: str,
+    product_id: str,
+    title: str,
+    price: str,
+    base_plan_id: str = "monthly",
+    billing_period: str = "P1M",
+    currency_code: str = "USD",
+    language: str = "en-US",
+    description: str | None = None,
+    benefits: list[str] | None = None,
+    extra_listings: dict[str, dict[str, Any]] | None = None,
+    grace_period: str | None = None,
+    activate: bool = True,
+) -> dict[str, Any]:
+    """Create an auto-renewing subscription priced in every region from one price.
+
+    Creates the subscription with one base plan, converts the price to every
+    region with Play's regional pricing, and activates the base plan.
+    Use create_subscription_offer afterwards for free trials / intro prices.
+    Disabled in read-only mode.
+
+    Args:
+        package_name: App package name
+        product_id: Subscription ID - lowercase letters, digits, '_' and '.'
+        title: Subscription title in `language`
+        price: Price per billing period in major units, e.g. "4.99"
+        base_plan_id: Base plan ID - lowercase letters, digits, '-' (default "monthly")
+        billing_period: P1W, P1M, P3M, P6M or P1Y (default P1M)
+        currency_code: Currency of `price` (default USD)
+        language: BCP-47 language of the listing (default en-US)
+        description: Optional description (max 200 characters)
+        benefits: Optional list of up to 4 benefits shown on the Play Store
+        extra_listings: Optional translations, e.g.
+            {"de-DE": {"title": "...", "description": "...", "benefits": ["..."]}}
+        grace_period: Optional grace period: P3D, P7D, P14D or P30D
+        activate: Activate the base plan (default true)
+
+    Returns:
+        Result with base price, regions version and number of priced regions
+    """
+    if blocked := _read_only_block("create_subscription_with_price"):
+        return blocked
+    client = get_client_from_context()
+    return client.create_subscription_with_price(
+        package_name=package_name,
+        product_id=product_id,
+        title=title,
+        price=price,
+        base_plan_id=base_plan_id,
+        billing_period=billing_period,
+        currency_code=currency_code,
+        language=language,
+        description=description,
+        benefits=benefits,
+        extra_listings=extra_listings,
+        grace_period=grace_period,
+        activate=activate,
+    ).model_dump()
+
+
+@mcp.tool()
+def replace_listing_images(
+    package_name: str,
+    language: str,
+    image_type: str,
+    image_paths: list[str],
+    replace_existing: bool = True,
+) -> dict[str, Any]:
+    """Upload several store-listing images for one language in a single commit.
+
+    By default the existing images of that type are removed first, so the
+    listing ends up with exactly these images in this order. All-or-nothing:
+    if any upload fails, nothing changes. Disabled in read-only mode.
+
+    Args:
+        package_name: App package name
+        language: Language localization code (BCP-47 tag, e.g. en-US)
+        image_type: One of phoneScreenshots, sevenInchScreenshots, tenInchScreenshots,
+            tvScreenshots, wearScreenshots (up to 8 each), icon, featureGraphic,
+            tvBanner (exactly 1)
+        image_paths: Local PNG/JPEG file paths, in display order
+        replace_existing: Remove existing images of this type first (default true);
+            false appends to them
+
+    Returns:
+        Uploaded images, number removed, and whether the change was sent for review
+    """
+    if blocked := _read_only_block("replace_listing_images"):
+        return blocked
+    client = get_client_from_context()
+    return client.replace_images(
+        package_name=package_name,
+        language=language,
+        image_type=image_type,
+        image_paths=image_paths,
+        replace_existing=replace_existing,
+    ).model_dump()
+
+
+@mcp.tool()
+def sync_listing_from_directory(
+    package_name: str,
+    directory: str,
+    languages: list[str] | None = None,
+    replace_images: bool = True,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Sync store listing text and images for all languages from a local folder.
+
+    The folder uses the fastlane "supply" layout (existing fastlane metadata
+    works as-is):
+
+        <directory>/en-US/title.txt, short_description.txt, full_description.txt,
+                          video.txt
+        <directory>/en-US/images/icon.png, featureGraphic.png, tvBanner.png
+        <directory>/en-US/images/phoneScreenshots/1.png, 2.png, ...
+        (also sevenInchScreenshots/, tenInchScreenshots/, tvScreenshots/,
+         wearScreenshots/), and one folder per language (de-DE/, fr-FR/, ...)
+
+    Only what is present in the folder changes. Everything is validated first
+    (title <= 30, short description <= 80, full description <= 4000 chars,
+    <= 8 screenshots per type) and applied in one commit. Use dry_run=true to
+    preview. Writes are disabled in read-only mode; dry runs are allowed.
+
+    Args:
+        package_name: App package name
+        directory: Path to the metadata folder (e.g. fastlane/metadata/android)
+        languages: Only sync these language folders (default: all)
+        replace_images: Make Play's images exactly match the folder (default true);
+            false appends to the existing images
+        dry_run: Validate and report the plan without changing anything
+
+    Returns:
+        Per-language summary of text fields and images, validation problems, and
+        whether the change was sent for review
+    """
+    if not dry_run and (blocked := _read_only_block("sync_listing_from_directory")):
+        return blocked
+    client = get_client_from_context()
+    return client.sync_listing_from_directory(
+        package_name=package_name,
+        directory=directory,
+        languages=languages,
+        replace_images=replace_images,
+        dry_run=dry_run,
+    ).model_dump()
 
 
 # =============================================================================

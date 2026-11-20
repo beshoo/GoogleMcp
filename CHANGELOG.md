@@ -11,6 +11,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `convert_region_prices`: convert one price into Play prices for every region
+  using `monetization.convertRegionPrices` (read-only).
+- `create_one_time_product_with_price` / `batch_create_one_time_products_with_price`:
+  create one-time in-app products priced in every region from one price, with a
+  legacy-compatible buy option, and activate them. Refuses to overwrite an
+  existing product unless `overwrite=true`. The batch tool converts each
+  distinct price once.
+- `create_subscription_with_price`: create an auto-renewing subscription and
+  base plan priced in every region from one price, and activate it.
+- `replace_listing_images`: upload several images for one language and type in
+  a single all-or-nothing commit, optionally replacing the existing ones.
+- `sync_listing_from_directory`: sync listing text and images for every
+  language from a fastlane-`supply`-style folder in one commit, with
+  validation and `dry_run`.
+- `deploy_app` accepts `release_status` (e.g. `"draft"`).
+- `PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR` (`error` | `cancel`) sets
+  `changesInReviewBehavior` on every commit, so a commit can refuse instead of
+  silently cancelling a review already in progress.
+
+### Changed
+- `deploy_app` and `promote_release` retry the release as `draft` when Play
+  says the app is still a draft (never published), so the first upload of a
+  new app no longer fails.
+- Commits that Play refuses to send for review automatically are retried with
+  `changesNotSentForReview=true`; the result tells you to send the changes
+  for review from the Play Console.
+
+### Fixed
+- `validate_listing_text` and the listing tools enforced a 50-character
+  title; Google Play's app-name limit is 30.
+
 ### Security
 - The published package metadata now requires `urllib3>=2.8.0` and
   `authlib>=1.9.1`, as it already did `pyjwt>=2.15.1`. 0.7.0's lockfile and
@@ -18,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could keep an older, vulnerable copy that was already installed.
 
 ### Planned
-- Consolidate and reduce the MCP tool surface (now 117 tools) by grouping
+- Consolidate and reduce the MCP tool surface (now 123 tools) by grouping
   related operations, to lower per-request tool-list overhead — with no planned
   loss of functionality.
 

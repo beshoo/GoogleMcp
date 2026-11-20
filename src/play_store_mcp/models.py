@@ -557,3 +557,109 @@ class InternalAppSharingArtifact(BaseModel):
         None, description="SHA-256 fingerprint of the signing certificate"
     )
     sha256: str | None = Field(None, description="SHA-256 hash of the artifact")
+
+
+# =============================================================================
+# Workflow results (regional pricing, image batches, listing sync)
+# =============================================================================
+
+
+class RegionalPriceConversion(BaseModel):
+    """One base price converted by Google Play into every billable region."""
+
+    package_name: str = Field(..., description=_DESC_PACKAGE_NAME)
+    base_price: str = Field(..., description="The price that was converted, e.g. '4.99 USD'")
+    regions_version: str = Field(..., description="Regions version the prices were generated at")
+    region_count: int = Field(0, description="Number of regions with a converted price")
+    regional_prices: dict[str, str] = Field(
+        default_factory=dict,
+        description="Region code to tax-inclusive converted price, e.g. {'DE': '5.49 EUR'}",
+    )
+    other_regions_usd: str | None = Field(
+        None, description="Price used for regions Play may launch in the future (USD)"
+    )
+    other_regions_eur: str | None = Field(
+        None, description="Price used for regions Play may launch in the future (EUR)"
+    )
+
+
+class ProductSetupResult(OperationResult):
+    """Result of creating a priced one-time product or subscription in one step."""
+
+    package_name: str = Field(..., description=_DESC_PACKAGE_NAME)
+    product_id: str = Field(..., description="Product ID")
+    product_kind: str = Field(..., description="'one_time_product' or 'subscription'")
+    base_price: str | None = Field(None, description="Base price that was converted")
+    regions_version: str | None = Field(None, description="Regions version used for prices")
+    region_count: int = Field(0, description="Number of regions priced")
+    activated: bool = Field(
+        False, description="Whether the purchase option / base plan was activated"
+    )
+    option_id: str | None = Field(
+        None, description="Purchase option ID (one-time) or base plan ID (subscription)"
+    )
+
+
+class BatchProductSetupResult(BaseModel):
+    """Result of creating several priced products."""
+
+    success: bool = Field(..., description="True when every product succeeded")
+    message: str = Field(..., description=_DESC_STATUS_MESSAGE)
+    successful_count: int = Field(0, description="Number of products created")
+    failed_count: int = Field(0, description="Number of products that failed")
+    results: list[ProductSetupResult] = Field(
+        default_factory=list, description="Per-product results, in input order"
+    )
+
+
+class ImageBatchResult(OperationResult):
+    """Result of uploading (and optionally replacing) several listing images in one edit."""
+
+    package_name: str = Field(..., description=_DESC_PACKAGE_NAME)
+    language: str = Field(..., description="Language localization code (BCP-47 tag)")
+    image_type: str = Field(..., description="Image type the upload applied to")
+    deleted_count: int = Field(0, description="Existing images removed before uploading")
+    uploaded: list[AppImage] = Field(default_factory=list, description="Uploaded images")
+    sent_for_review: bool | None = Field(
+        None,
+        description=(
+            "False when Play refused to send the change for review automatically; it is "
+            "saved and must be sent for review from the Play Console"
+        ),
+    )
+
+
+class ListingSyncLanguage(BaseModel):
+    """What a listing sync did (or would do) for one language."""
+
+    language: str = Field(..., description="Language localization code (BCP-47 tag)")
+    text_fields: list[str] = Field(
+        default_factory=list, description="Listing text fields updated, e.g. ['title']"
+    )
+    images: dict[str, int] = Field(
+        default_factory=dict, description="Image type to number of images uploaded"
+    )
+    deleted_images: dict[str, int] = Field(
+        default_factory=dict, description="Image type to number of existing images removed"
+    )
+
+
+class ListingSyncResult(OperationResult):
+    """Result of syncing a store listing from a local metadata directory."""
+
+    package_name: str = Field(..., description=_DESC_PACKAGE_NAME)
+    directory: str = Field(..., description="Metadata directory that was read")
+    dry_run: bool = Field(False, description="True when nothing was changed on Play")
+    languages: list[ListingSyncLanguage] = Field(
+        default_factory=list, description="Per-language summary"
+    )
+    problems: list[str] = Field(
+        default_factory=list, description="Validation problems that blocked the sync"
+    )
+    sent_for_review: bool | None = Field(
+        None,
+        description=(
+            "False when Play refused to send the change for review automatically; it is "
+            "saved and must be sent for review from the Play Console"
+        ),
+    )

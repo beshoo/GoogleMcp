@@ -5,7 +5,7 @@ Tools for managing app store listings across languages.
 !!! info "Text Limits"
     | Field | Max Length |
     |---|---|
-    | Title | 50 characters |
+    | Title | 30 characters |
     | Short description | 80 characters |
     | Full description | 4,000 characters |
 
@@ -38,7 +38,7 @@ Update the store listing for a specific language. Only provided fields are updat
 |---|---|---|---|
 | `package_name` | string | Yes | App package name |
 | `language` | string | Yes | Language code |
-| `title` | string | No | App title (max 50 chars) |
+| `title` | string | No | App title (max 30 chars) |
 | `full_description` | string | No | Full description (max 4,000 chars) |
 | `short_description` | string | No | Short description (max 80 chars) |
 | `video` | string | No | YouTube video URL |

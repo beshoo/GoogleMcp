@@ -16,6 +16,16 @@
 
 An MCP (Model Context Protocol) server that connects to the Google Play Developer API. Deploy apps, manage releases, respond to reviews, and monitor app health — all through your AI assistant.
 
+> **About this fork.** This is a fork of
+> [lusky3/play-store-mcp](https://github.com/lusky3/play-store-mcp) that adds
+> high-level workflows, several modeled on
+> [Jang-myoung-gyoon/google-play-mcp](https://github.com/Jang-myoung-gyoon/google-play-mcp):
+> one-price **regional pricing** for in-app products and subscriptions,
+> **all-or-nothing image replacement**, **whole-listing sync from a
+> fastlane-style folder**, and automatic handling of **draft apps** and
+> **"changes not sent for review"** commits. See
+> [Workflow Tools](#workflow-tools-this-fork) below.
+
 📖 **[Full Documentation](https://lusky3.github.io/play-store-mcp)**
 
 ## ✨ Features
@@ -36,6 +46,8 @@ An MCP (Model Context Protocol) server that connects to the Google Play Develope
 - 🐳 **Docker Support** — Run as a container with health checks
 - 🔑 **Per-Request Credentials** — Bring-your-own-credentials for multi-tenant deployments
 - 🔒 **Secure** — Google Cloud service account authentication
+- 💲 **One-Price Regional Pricing** — Give one price, get every region priced with Play's own conversion
+- 🖼️ **Listing Sync** — Push titles, descriptions, icons and screenshots for every language from one folder
 
 ## 🚀 Quick Start
 
@@ -231,6 +243,60 @@ Add to `.kiro/settings/mcp.json`:
 | `update_rollout` | Update rollout percentage for a staged release |
 | `get_app_details` | Get app metadata (title, description, etc.) |
 
+### Workflow Tools (this fork)
+
+| Tool | Description |
+| --- | --- |
+| `convert_region_prices` | Convert one price (e.g. `"4.99"` USD) to Play prices for every region (read-only) |
+| `create_one_time_product_with_price` | Create a one-time in-app product priced in every region from one price, and activate it |
+| `batch_create_one_time_products_with_price` | Create many priced one-time products; each distinct price is converted once |
+| `create_subscription_with_price` | Create an auto-renewing subscription + base plan priced in every region, and activate it |
+| `replace_listing_images` | Upload several screenshots/icon/feature graphic for one language in a single all-or-nothing commit |
+| `sync_listing_from_directory` | Sync listing text and images for every language from a fastlane-style folder (supports `dry_run`) |
+
+`deploy_app` and `promote_release` also gained:
+
+- **Draft-app handling** — an app that has never been published only accepts
+  `draft` releases. The release is retried as a draft automatically, so the
+  first upload of a new app works.
+- **`release_status`** on `deploy_app` — pass `"draft"` to stage a release
+  without rolling it out.
+- **Review fallback** — when Play refuses to send changes for review
+  automatically, the commit is retried with `changesNotSentForReview=true` and
+  the result tells you to send them for review from the Play Console.
+
+#### Listing folder layout
+
+`sync_listing_from_directory` reads the same layout as fastlane `supply`, so
+existing `fastlane/metadata/android` folders work unchanged:
+
+```text
+metadata/
+├── en-US/
+│   ├── title.txt               # max 30 chars
+│   ├── short_description.txt   # max 80 chars
+│   ├── full_description.txt    # max 4000 chars
+│   ├── video.txt               # optional YouTube URL
+│   └── images/
+│       ├── icon.png            # 512x512
+│       ├── featureGraphic.png  # 1024x500
+│       ├── phoneScreenshots/   # 1.png, 2.png, ... (up to 8, natural sort order)
+│       ├── sevenInchScreenshots/
+│       └── tenInchScreenshots/
+└── de-DE/
+    └── ...
+```
+
+Only what exists in the folder is changed. Everything is validated first and
+applied in one commit; use `dry_run=true` to preview.
+
+#### Example prompts
+
+- *"Create a consumable `coins_500` called '500 Coins' for $1.99 in com.example.app."*
+- *"Create a monthly subscription `premium` at $4.99 with benefits 'No ads' and 'Cloud sync'."*
+- *"Dry-run a listing sync from ./fastlane/metadata/android, then apply it."*
+- *"Replace the en-US phone screenshots with the PNGs in ./shots."*
+
 ### Store Listings Tools
 
 | Tool | Description |
@@ -329,6 +395,7 @@ Add to `.kiro/settings/mcp.json`:
 | `PLAY_STORE_MCP_READ_ONLY` | Disable all write operations (deploy, promote, rollout, reply, listing/tester updates) | No (default: off) |
 | `PLAY_STORE_MCP_DOWNLOAD_DIR` | Directory that APK/AAB downloads are confined to (path-traversal / arbitrary-write protection). Downloads are always confined; defaults to the working directory when unset | No (defaults to cwd); **recommended** for network/hosted deployments — the server warns if unset |
 | `CODE_MODE` | Set to `0` to opt out of the code-mode transform and use the classic tool list | No (default: on) |
+| `PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR` | What a commit does when other changes are already in review: `error` refuses instead of cancelling that review; `cancel` cancels it and resubmits (Google's default) | No (default: Google's default, which cancels the in-progress review) |
 
 ## 🧪 Development
 
@@ -383,6 +450,8 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 ## 🙏 Acknowledgments
 
+- Forked from [lusky3/play-store-mcp](https://github.com/lusky3/play-store-mcp) (MIT)
+- Workflow ideas (regional price conversion, batch image upload, draft-app commits) from [Jang-myoung-gyoon/google-play-mcp](https://github.com/Jang-myoung-gyoon/google-play-mcp), re-implemented here
 - Inspired by [antoniolg/play-store-mcp](https://github.com/antoniolg/play-store-mcp) (Kotlin)
 - Built with the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
 - Uses the [Google Play Developer API](https://developers.google.com/android-publisher)

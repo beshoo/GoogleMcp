@@ -31,6 +31,7 @@ from play_store_mcp.models import (
     AppRecovery,
     AppRecoveryResult,
     BatchDeploymentResult,
+    BatchProductSetupResult,
     Bundle,
     DataSafetyResult,
     DeobfuscationFile,
@@ -41,11 +42,14 @@ from play_store_mcp.models import (
     ExternalTransaction,
     GeneratedApksDownload,
     Grant,
+    ImageBatchResult,
     ImageDeleteResult,
     InAppProduct,
     InAppProductActionResult,
     InternalAppSharingArtifact,
     Listing,
+    ListingSyncLanguage,
+    ListingSyncResult,
     ListingUpdateResult,
     OneTimeProduct,
     OneTimeProductActionResult,
@@ -57,6 +61,8 @@ from play_store_mcp.models import (
     ProductPurchase,
     ProductPurchaseActionResult,
     ProductPurchaseV2,
+    ProductSetupResult,
+    RegionalPriceConversion,
     Release,
     Review,
     ReviewReplyResult,
@@ -71,6 +77,15 @@ from play_store_mcp.models import (
     User,
     ValidationResult,
     VoidedPurchase,
+)
+from play_store_mcp.pricing import (
+    PriceError,
+    format_money,
+    one_time_regional_configs,
+    parse_money,
+    regions_version,
+    subscription_regional_configs,
+    summarize_conversion,
 )
 
 if TYPE_CHECKING:
@@ -100,6 +115,55 @@ _MIME_TYPE_APK = "application/vnd.android.package-archive"
 
 # Default schema version for regional pricing data
 DEFAULT_REGIONS_VERSION = "2022/02"
+
+# Google Play's store-listing text limits (characters).
+LISTING_TITLE_MAX = 30
+LISTING_SHORT_DESCRIPTION_MAX = 80
+LISTING_FULL_DESCRIPTION_MAX = 4000
+
+# How edits.commit behaves when other changes are already in review. Google's
+# default (CANCEL_IN_REVIEW_AND_SUBMIT) silently cancels an in-progress review,
+# e.g. pushing an internal build would cancel a production review. Set
+# PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR=error to refuse instead, or =cancel to opt
+# into Google's default explicitly.
+_IN_REVIEW_BEHAVIORS = {
+    "cancel": "CANCEL_IN_REVIEW_AND_SUBMIT",
+    "error": "ERROR_IF_IN_REVIEW",
+}
+
+# Store-listing image types and limits.
+_SINGLE_IMAGE_TYPES = frozenset({"icon", "featureGraphic", "tvBanner"})
+_SCREENSHOT_TYPES = frozenset(
+    {
+        "phoneScreenshots",
+        "sevenInchScreenshots",
+        "tenInchScreenshots",
+        "tvScreenshots",
+        "wearScreenshots",
+    }
+)
+_IMAGE_TYPES = _SINGLE_IMAGE_TYPES | _SCREENSHOT_TYPES
+_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg"})
+_MAX_SCREENSHOTS = 8
+
+# fastlane-supply metadata file names -> Play listing fields.
+_LISTING_TEXT_FILES = {
+    "title.txt": "title",
+    "short_description.txt": "shortDescription",
+    "full_description.txt": "fullDescription",
+    "video.txt": "video",
+}
+_LANGUAGE_DIR_RE = re.compile(r"[a-z]{2,3}(-[A-Za-z0-9]{2,8})*")
+_DIGITS_RE = re.compile(r"(\d+)")
+
+# Monetization identifiers.
+_PRODUCT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.]{0,138}")
+_OPTION_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+_BILLING_PERIODS = frozenset({"P1W", "P1M", "P3M", "P6M", "P1Y"})
+
+# Error fragments Play returns for the two commit situations we recover from.
+_DRAFT_APP_ERROR_MARKERS = ("draft app", "status draft")
+_NOT_SENT_FOR_REVIEW_MARKER = "changesnotsentforreview"
 
 # HTTP methods whose requests are safe to retry on an ambiguous server error
 # (500/503): repeating them cannot create a duplicate side effect. Non-idempotent
@@ -393,7 +457,7 @@ class PlayStoreClient:
         """Validate store listing text lengths.
 
         Args:
-            title: App title (max 50 chars).
+            title: App title (max 30 chars, Google Play's app-name limit).
             short_description: Short description (max 80 chars).
             full_description: Full description (max 4000 chars).
 
@@ -402,29 +466,35 @@ class PlayStoreClient:
         """
         errors: list[ValidationResult] = []
 
-        if title and len(title) > 50:
+        if title and len(title) > LISTING_TITLE_MAX:
             errors.append(
                 ValidationResult(
                     field="title",
-                    message="Title must be 50 characters or less",
+                    message=f"Title must be {LISTING_TITLE_MAX} characters or less",
                     value=f"{len(title)} characters",
                 )
             )
 
-        if short_description and len(short_description) > 80:
+        if short_description and len(short_description) > LISTING_SHORT_DESCRIPTION_MAX:
             errors.append(
                 ValidationResult(
                     field="short_description",
-                    message="Short description must be 80 characters or less",
+                    message=(
+                        f"Short description must be {LISTING_SHORT_DESCRIPTION_MAX} "
+                        "characters or less"
+                    ),
                     value=f"{len(short_description)} characters",
                 )
             )
 
-        if full_description and len(full_description) > 4000:
+        if full_description and len(full_description) > LISTING_FULL_DESCRIPTION_MAX:
             errors.append(
                 ValidationResult(
                     field="full_description",
-                    message="Full description must be 4000 characters or less",
+                    message=(
+                        f"Full description must be {LISTING_FULL_DESCRIPTION_MAX} "
+                        "characters or less"
+                    ),
                     value=f"{len(full_description)} characters",
                 )
             )
@@ -605,16 +675,151 @@ class PlayStoreClient:
         self._logger.debug("Created edit", package_name=package_name, edit_id=edit_id)
         return edit_id
 
-    def _commit_edit(self, package_name: str, edit_id: str) -> None:
+    @staticmethod
+    def _http_error_text(error: BaseException) -> str:
+        """Return an HttpError's reason plus response body, lower-cased, for matching."""
+        parts = [str(getattr(error, "reason", "") or "")]
+        content = getattr(error, "content", b"")
+        if isinstance(content, bytes):
+            parts.append(content.decode("utf-8", errors="replace"))
+        elif content:
+            parts.append(str(content))
+        parts.append(str(error))
+        return " ".join(parts).lower()
+
+    @classmethod
+    def _is_draft_app_error(cls, error: BaseException) -> bool:
+        """True when Play rejected a release because the app has never been published."""
+        if not isinstance(error, HttpError):
+            return False
+        text = cls._http_error_text(error)
+        return any(marker in text for marker in _DRAFT_APP_ERROR_MARKERS)
+
+    @classmethod
+    def _is_not_sent_for_review_error(cls, error: BaseException) -> bool:
+        """True when Play asks for changesNotSentForReview=true to accept a commit."""
+        if not isinstance(error, HttpError):
+            return False
+        return _NOT_SENT_FOR_REVIEW_MARKER in cls._http_error_text(error)
+
+    @staticmethod
+    def _commit_kwargs() -> dict[str, Any]:
+        """Extra edits.commit query parameters derived from the environment."""
+        behavior = os.environ.get("PLAY_STORE_MCP_IN_REVIEW_BEHAVIOR", "").strip().lower()
+        if behavior in _IN_REVIEW_BEHAVIORS:
+            return {"changesInReviewBehavior": _IN_REVIEW_BEHAVIORS[behavior]}
+        return {}
+
+    def _commit_edit(self, package_name: str, edit_id: str) -> bool:
         """Commit an edit.
+
+        If Play refuses to send the changes for review automatically (it says
+        to set ``changesNotSentForReview``, e.g. after a rejection or when
+        managed publishing requires it), the commit is retried with that flag
+        so the changes are saved; they then have to be sent for review from
+        the Play Console.
 
         Args:
             package_name: App package name.
             edit_id: Edit ID to commit.
+
+        Returns:
+            True if the changes were sent for review/publishing, False if they
+            were saved without being sent for review.
         """
         service = self._get_service()
-        self._execute(service.edits().commit(packageName=package_name, editId=edit_id))
+        kwargs = self._commit_kwargs()
+        try:
+            self._execute(
+                service.edits().commit(packageName=package_name, editId=edit_id, **kwargs)
+            )
+        except HttpError as e:
+            if not self._is_not_sent_for_review_error(e):
+                raise
+            self._logger.warning(
+                "Play refused to send changes for review automatically; "
+                "committing with changesNotSentForReview=true",
+                package_name=package_name,
+                edit_id=edit_id,
+            )
+            self._execute(
+                service.edits().commit(
+                    packageName=package_name,
+                    editId=edit_id,
+                    changesNotSentForReview=True,
+                    **kwargs,
+                )
+            )
+            self._logger.debug("Committed edit (not sent for review)", edit_id=edit_id)
+            return False
         self._logger.debug("Committed edit", package_name=package_name, edit_id=edit_id)
+        return True
+
+    def _update_track_and_commit(
+        self,
+        package_name: str,
+        edit_id: str,
+        track: str,
+        release_body: dict[str, Any],
+    ) -> tuple[str, bool]:
+        """Put ``release_body`` on ``track`` and commit, handling draft apps.
+
+        An app that has never been published only accepts releases with
+        status ``draft``; Play rejects anything else either on the track
+        update or on commit. When that happens, the release is re-applied as
+        a draft in the same edit and committed again, so the first upload of
+        a new app works without the caller knowing about the rule.
+
+        Returns:
+            ``(release_status_used, sent_for_review)``.
+        """
+        service = self._get_service()
+
+        def _apply(body: dict[str, Any]) -> bool:
+            self._execute(
+                service.edits()
+                .tracks()
+                .update(
+                    packageName=package_name,
+                    editId=edit_id,
+                    track=track,
+                    body={"releases": [body]},
+                )
+            )
+            return self._commit_edit(package_name, edit_id)
+
+        status = str(release_body.get("status", "completed"))
+        try:
+            return status, _apply(release_body)
+        except HttpError as e:
+            if status == "draft" or not self._is_draft_app_error(e):
+                raise
+            self._logger.warning(
+                "App is still a draft on Google Play; retrying the release with status=draft",
+                package_name=package_name,
+                track=track,
+            )
+            draft_body = {
+                key: value for key, value in release_body.items() if key != "userFraction"
+            }
+            draft_body["status"] = "draft"
+            return "draft", _apply(draft_body)
+
+    @staticmethod
+    def _review_note(release_status: str, sent_for_review: bool) -> str:
+        """Human-readable suffix describing draft/review fallbacks, or ''."""
+        notes: list[str] = []
+        if release_status == "draft":
+            notes.append(
+                "the app is still a draft on Google Play, so the release was saved as a "
+                "draft; finish the app setup and roll it out from the Play Console"
+            )
+        if not sent_for_review:
+            notes.append(
+                "Play would not send the changes for review automatically; they are saved "
+                "and must be sent for review from the Play Console (Publishing overview)"
+            )
+        return f" (note: {'; '.join(notes)})" if notes else ""
 
     def _delete_edit(self, package_name: str, edit_id: str) -> None:
         """Delete an edit without committing.
@@ -780,6 +985,7 @@ class PlayStoreClient:
         release_notes: str | dict[str, str] | None = None,
         release_notes_language: str = "en-US",
         rollout_percentage: float = 100.0,
+        release_status: str | None = None,
     ) -> DeploymentResult:
         """Deploy an APK or AAB to a track.
 
@@ -791,6 +997,10 @@ class PlayStoreClient:
                           dict mapping language codes to release notes for multiple languages.
             release_notes_language: Language code for release notes (used only if release_notes is a string).
             rollout_percentage: Rollout percentage (0-100).
+            release_status: Optional explicit release status ("draft",
+                "completed", "inProgress", "halted"). Defaults to "completed",
+                or "inProgress" when rollout_percentage < 100. Apps that have
+                never been published automatically fall back to "draft".
 
         Returns:
             Deployment result.
@@ -843,22 +1053,16 @@ class PlayStoreClient:
             release_body = self._build_release_body(
                 uploaded_version_code, rollout_percentage, release_notes, release_notes_language
             )
+            if release_status:
+                release_body["status"] = release_status
+                if release_status != "inProgress":
+                    release_body.pop("userFraction", None)
 
-            # Update track
-            track_body = {"releases": [release_body]}
-            self._execute(
-                service.edits()
-                .tracks()
-                .update(
-                    packageName=package_name,
-                    editId=edit_id,
-                    track=track,
-                    body=track_body,
-                )
+            # Update track and commit (falls back to a draft release for apps
+            # that have never been published).
+            status_used, sent_for_review = self._update_track_and_commit(
+                package_name, edit_id, track, release_body
             )
-
-            # Commit
-            self._commit_edit(package_name, edit_id)
 
             return DeploymentResult(
                 success=True,
@@ -866,7 +1070,10 @@ class PlayStoreClient:
                 package_name=package_name,
                 track=track,
                 version_code=uploaded_version_code,
-                message=f"Successfully deployed version {uploaded_version_code} to {track}",
+                message=(
+                    f"Successfully deployed version {uploaded_version_code} to {track}"
+                    + self._review_note(status_used, sent_for_review)
+                ),
             )
 
         except Exception as e:
@@ -950,19 +1157,10 @@ class PlayStoreClient:
             else:
                 new_release["status"] = "completed"
 
-            # Update target track
-            self._execute(
-                service.edits()
-                .tracks()
-                .update(
-                    packageName=package_name,
-                    editId=edit_id,
-                    track=to_track,
-                    body={"releases": [new_release]},
-                )
+            # Update target track and commit (draft-app aware).
+            status_used, sent_for_review = self._update_track_and_commit(
+                package_name, edit_id, to_track, new_release
             )
-
-            self._commit_edit(package_name, edit_id)
 
             return DeploymentResult(
                 success=True,
@@ -970,7 +1168,10 @@ class PlayStoreClient:
                 package_name=package_name,
                 track=to_track,
                 version_code=version_code,
-                message=f"Successfully promoted version {version_code} from {from_track} to {to_track}",
+                message=(
+                    f"Successfully promoted version {version_code} from {from_track} "
+                    f"to {to_track}" + self._review_note(status_used, sent_for_review)
+                ),
             )
 
         except Exception as e:
@@ -4117,7 +4318,7 @@ class PlayStoreClient:
         Args:
             package_name: App package name.
             language: Language code (e.g., en-US, es-ES).
-            title: App title (max 50 characters).
+            title: App title (max 30 characters).
             full_description: Full description (max 4000 characters).
             short_description: Short description (max 80 characters).
             video: YouTube video URL.
@@ -4966,6 +5167,827 @@ class PlayStoreClient:
                 image_type=image_type,
                 deleted_count=0,
             )
+
+    # =========================================================================
+    # Workflows: regional pricing, priced products, image batches, listing sync
+    # =========================================================================
+
+    def _convert_prices_raw(
+        self, package_name: str, price: str | float, currency_code: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return ``(base_money, convertRegionPrices response)`` for one price."""
+        try:
+            money = parse_money(price, currency_code)
+        except PriceError as e:
+            raise PlayStoreClientError(str(e)) from e
+        service = self._get_service()
+        try:
+            # A POST, but it only computes prices; repeating it is harmless.
+            result = self._execute(
+                service.monetization().convertRegionPrices(
+                    packageName=package_name, body={"price": money}
+                ),
+                retry_ambiguous=True,
+            )
+        except HttpError as e:
+            self._logger.exception("Failed to convert regional prices", error=str(e))
+            raise PlayStoreClientError(f"Failed to convert regional prices: {e.reason}") from e
+        return money, result
+
+    def convert_region_prices(
+        self, package_name: str, price: str | float, currency_code: str = "USD"
+    ) -> RegionalPriceConversion:
+        """Convert one price into Google Play prices for every billable region.
+
+        Uses Play's own exchange rates and local price rounding (the same
+        conversion the Play Console applies when you set a default price).
+
+        Args:
+            package_name: App package name.
+            price: Base price in major units, e.g. "4.99".
+            currency_code: ISO 4217 currency of ``price`` (default USD).
+
+        Returns:
+            The converted prices per region plus the regions version to use.
+        """
+        self._logger.info(
+            "Converting regional prices", package_name=package_name, currency=currency_code
+        )
+        money, result = self._convert_prices_raw(package_name, price, currency_code)
+        try:
+            regional = summarize_conversion(result)
+        except PriceError as e:
+            raise PlayStoreClientError(str(e)) from e
+        other = result.get("convertedOtherRegionsPrice") or {}
+        return RegionalPriceConversion(
+            package_name=package_name,
+            base_price=format_money(money),
+            regions_version=regions_version(result, DEFAULT_REGIONS_VERSION),
+            region_count=len(regional),
+            regional_prices=regional,
+            other_regions_usd=format_money(other["usdPrice"]) if other.get("usdPrice") else None,
+            other_regions_eur=format_money(other["eurPrice"]) if other.get("eurPrice") else None,
+        )
+
+    @staticmethod
+    def _build_listings(
+        language: str,
+        title: str,
+        description: str | None,
+        extra_listings: dict[str, dict[str, Any]] | None,
+        *,
+        include_benefits: bool = False,
+        benefits: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build a monetization ``listings`` array (default language first)."""
+        primary: dict[str, Any] = {"languageCode": language, "title": title}
+        if description is not None:
+            primary["description"] = description
+        if include_benefits and benefits:
+            primary["benefits"] = list(benefits)
+        listings = [primary]
+        for lang, fields in (extra_listings or {}).items():
+            if lang == language:
+                continue
+            if not fields.get("title"):
+                raise PlayStoreClientError(f"extra_listings[{lang!r}] needs a 'title'")
+            entry: dict[str, Any] = {"languageCode": lang, "title": fields["title"]}
+            if fields.get("description") is not None:
+                entry["description"] = fields["description"]
+            if include_benefits and fields.get("benefits"):
+                entry["benefits"] = list(fields["benefits"])
+            listings.append(entry)
+        return listings
+
+    def create_one_time_product_with_price(
+        self,
+        package_name: str,
+        product_id: str,
+        title: str,
+        description: str,
+        price: str | float,
+        currency_code: str = "USD",
+        language: str = "en-US",
+        extra_listings: dict[str, dict[str, Any]] | None = None,
+        purchase_option_id: str = "default",
+        activate: bool = True,
+        overwrite: bool = False,
+        _conversion_cache: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]]]
+        | None = None,
+    ) -> ProductSetupResult:
+        """Create a one-time in-app product priced in every region from one price.
+
+        Converts ``price`` with Play's regional pricing, creates the product
+        with a single buy purchase option (legacy-compatible, so older Play
+        Billing Library versions can buy it), and activates that option.
+
+        Args:
+            package_name: App package name.
+            product_id: Product ID (lowercase letters, digits, '_' and '.';
+                must start with a letter or digit).
+            title: Product title in ``language``.
+            description: Product description in ``language``.
+            price: Base price in major units, e.g. "0.99".
+            currency_code: Currency of ``price`` (default USD).
+            language: BCP-47 language of ``title``/``description``.
+            extra_listings: Optional {language: {"title": ..., "description": ...}}.
+            purchase_option_id: ID for the purchase option (default "default").
+            activate: Activate the purchase option so it can be bought.
+            overwrite: Replace an existing product with the same ID instead of
+                failing. Its listings and purchase options are replaced.
+
+        Returns:
+            Result with the regions version and number of priced regions.
+        """
+        self._logger.info(
+            "Creating priced one-time product", package_name=package_name, product_id=product_id
+        )
+        base: dict[str, Any] = {
+            "package_name": package_name,
+            "product_id": product_id,
+            "product_kind": "one_time_product",
+            "option_id": purchase_option_id,
+        }
+        try:
+            if not _PRODUCT_ID_RE.fullmatch(product_id):
+                raise PlayStoreClientError(
+                    "product_id must start with a lowercase letter or digit and contain only "
+                    "lowercase letters, digits, '_' and '.'"
+                )
+            if not _OPTION_ID_RE.fullmatch(purchase_option_id):
+                raise PlayStoreClientError(
+                    "purchase_option_id must be 1-63 lowercase letters, digits or '-', "
+                    "starting with a letter or digit"
+                )
+            service = self._get_service()
+
+            if not overwrite:
+                try:
+                    self._execute(
+                        service.monetization()
+                        .onetimeproducts()
+                        .get(packageName=package_name, productId=product_id)
+                    )
+                except HttpError as e:
+                    if getattr(getattr(e, "resp", None), "status", None) != 404:
+                        raise
+                else:
+                    return ProductSetupResult(
+                        success=False,
+                        message=(
+                            f"One-time product {product_id} already exists; pass overwrite=true "
+                            "to replace its listings and pricing"
+                        ),
+                        error="AlreadyExists",
+                        **base,
+                    )
+
+            cache_key = (str(price), currency_code.upper())
+            if _conversion_cache is not None and cache_key in _conversion_cache:
+                money, conversion = _conversion_cache[cache_key]
+            else:
+                money, conversion = self._convert_prices_raw(package_name, price, currency_code)
+                if _conversion_cache is not None:
+                    _conversion_cache[cache_key] = (money, conversion)
+            regional, new_regions = one_time_regional_configs(conversion)
+            version = regions_version(conversion, DEFAULT_REGIONS_VERSION)
+
+            body = {
+                "packageName": package_name,
+                "productId": product_id,
+                "listings": self._build_listings(language, title, description, extra_listings),
+                "purchaseOptions": [
+                    {
+                        "purchaseOptionId": purchase_option_id,
+                        "buyOption": {"legacyCompatible": True, "multiQuantityEnabled": False},
+                        "regionalPricingAndAvailabilityConfigs": regional,
+                        "newRegionsConfig": new_regions,
+                    }
+                ],
+            }
+            self._execute(
+                service.monetization()
+                .onetimeproducts()
+                .patch(
+                    packageName=package_name,
+                    productId=product_id,
+                    allowMissing=True,
+                    updateMask="listings,purchaseOptions",
+                    regionsVersion_version=version,
+                    body=body,
+                )
+            )
+
+            if activate:
+                self._execute(
+                    service.monetization()
+                    .onetimeproducts()
+                    .purchaseOptions()
+                    .batchUpdateStates(
+                        packageName=package_name,
+                        productId=product_id,
+                        body={
+                            "requests": [
+                                {
+                                    "activatePurchaseOptionRequest": {
+                                        "packageName": package_name,
+                                        "productId": product_id,
+                                        "purchaseOptionId": purchase_option_id,
+                                    }
+                                }
+                            ]
+                        },
+                    )
+                )
+
+            state = "active" if activate else "created (inactive)"
+            return ProductSetupResult(
+                success=True,
+                message=(
+                    f"One-time product {product_id} {state} at {format_money(money)} "
+                    f"across {len(regional)} regions"
+                ),
+                base_price=format_money(money),
+                regions_version=version,
+                region_count=len(regional),
+                activated=activate,
+                **base,
+            )
+        except Exception as e:
+            return self._fail_result(
+                ProductSetupResult,
+                f"Failed to create one-time product {product_id}",
+                e,
+                **base,
+            )
+
+    def batch_create_one_time_products_with_price(
+        self,
+        package_name: str,
+        products: list[dict[str, Any]],
+        activate: bool = True,
+        overwrite: bool = False,
+    ) -> BatchProductSetupResult:
+        """Create several priced one-time products; each price is converted once.
+
+        Args:
+            package_name: App package name.
+            products: Items with keys product_id, title, description, price and
+                optionally currency_code, language, extra_listings,
+                purchase_option_id.
+            activate: Activate each product's purchase option.
+            overwrite: Replace products that already exist.
+
+        Returns:
+            Per-product results plus totals. A failure does not stop the rest.
+        """
+        cache: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]]] = {}
+        results: list[ProductSetupResult] = []
+        for index, item in enumerate(products):
+            missing = [k for k in ("product_id", "title", "description", "price") if k not in item]
+            if missing:
+                results.append(
+                    ProductSetupResult(
+                        success=False,
+                        message=f"products[{index}] is missing: {', '.join(missing)}",
+                        error="InvalidInput",
+                        package_name=package_name,
+                        product_id=str(item.get("product_id", f"#{index}")),
+                        product_kind="one_time_product",
+                    )
+                )
+                continue
+            results.append(
+                self.create_one_time_product_with_price(
+                    package_name=package_name,
+                    product_id=str(item["product_id"]),
+                    title=str(item["title"]),
+                    description=str(item["description"]),
+                    price=item["price"],
+                    currency_code=str(item.get("currency_code", "USD")),
+                    language=str(item.get("language", "en-US")),
+                    extra_listings=item.get("extra_listings"),
+                    purchase_option_id=str(item.get("purchase_option_id", "default")),
+                    activate=activate,
+                    overwrite=overwrite,
+                    _conversion_cache=cache,
+                )
+            )
+        ok = sum(1 for r in results if r.success)
+        failed = len(results) - ok
+        return BatchProductSetupResult(
+            success=failed == 0,
+            message=f"Created {ok}/{len(results)} one-time products"
+            + (f" ({failed} failed)" if failed else ""),
+            successful_count=ok,
+            failed_count=failed,
+            results=results,
+        )
+
+    def create_subscription_with_price(
+        self,
+        package_name: str,
+        product_id: str,
+        title: str,
+        price: str | float,
+        base_plan_id: str = "monthly",
+        billing_period: str = "P1M",
+        currency_code: str = "USD",
+        language: str = "en-US",
+        description: str | None = None,
+        benefits: list[str] | None = None,
+        extra_listings: dict[str, dict[str, Any]] | None = None,
+        grace_period: str | None = None,
+        activate: bool = True,
+    ) -> ProductSetupResult:
+        """Create an auto-renewing subscription priced in every region from one price.
+
+        Args:
+            package_name: App package name.
+            product_id: Subscription product ID.
+            title: Subscription title in ``language``.
+            price: Base price per billing period, e.g. "4.99".
+            base_plan_id: Base plan ID (lowercase letters, digits, '-').
+            billing_period: ISO 8601 period: P1W, P1M, P3M, P6M or P1Y.
+            currency_code: Currency of ``price`` (default USD).
+            language: BCP-47 language of the listing.
+            description: Optional description (max 200 chars).
+            benefits: Optional list of up to 4 benefit strings.
+            extra_listings: Optional {language: {"title", "description", "benefits"}}.
+            grace_period: Optional ISO 8601 grace period (P3D, P7D, P14D, P30D).
+            activate: Activate the base plan so it can be purchased.
+
+        Returns:
+            Result with the regions version and number of priced regions.
+        """
+        self._logger.info(
+            "Creating priced subscription", package_name=package_name, product_id=product_id
+        )
+        base: dict[str, Any] = {
+            "package_name": package_name,
+            "product_id": product_id,
+            "product_kind": "subscription",
+            "option_id": base_plan_id,
+        }
+        try:
+            if not _PRODUCT_ID_RE.fullmatch(product_id):
+                raise PlayStoreClientError(
+                    "product_id must start with a lowercase letter or digit and contain only "
+                    "lowercase letters, digits, '_' and '.'"
+                )
+            if not _OPTION_ID_RE.fullmatch(base_plan_id):
+                raise PlayStoreClientError(
+                    "base_plan_id must be 1-63 lowercase letters, digits or '-', "
+                    "starting with a letter or digit"
+                )
+            period = billing_period.strip().upper()
+            if period not in _BILLING_PERIODS:
+                raise PlayStoreClientError(
+                    f"billing_period must be one of {', '.join(sorted(_BILLING_PERIODS))}"
+                )
+            if benefits and len(benefits) > 4:
+                raise PlayStoreClientError("A subscription listing allows at most 4 benefits")
+
+            money, conversion = self._convert_prices_raw(package_name, price, currency_code)
+            regional, other = subscription_regional_configs(conversion)
+            version = regions_version(conversion, DEFAULT_REGIONS_VERSION)
+
+            plan_type: dict[str, Any] = {"billingPeriodDuration": period, "legacyCompatible": True}
+            if grace_period:
+                plan_type["gracePeriodDuration"] = grace_period.strip().upper()
+
+            body = {
+                "packageName": package_name,
+                "productId": product_id,
+                "listings": self._build_listings(
+                    language,
+                    title,
+                    description,
+                    extra_listings,
+                    include_benefits=True,
+                    benefits=benefits,
+                ),
+                "basePlans": [
+                    {
+                        "basePlanId": base_plan_id,
+                        "autoRenewingBasePlanType": plan_type,
+                        "regionalConfigs": regional,
+                        "otherRegionsConfig": other,
+                    }
+                ],
+            }
+            service = self._get_service()
+            self._execute(
+                service.monetization()
+                .subscriptions()
+                .create(
+                    packageName=package_name,
+                    productId=product_id,
+                    regionsVersion_version=version,
+                    body=body,
+                )
+            )
+            if activate:
+                self.activate_base_plan(package_name, product_id, base_plan_id)
+
+            state = "active" if activate else "created (inactive)"
+            return ProductSetupResult(
+                success=True,
+                message=(
+                    f"Subscription {product_id} ({base_plan_id}, {period}) {state} at "
+                    f"{format_money(money)} across {len(regional)} regions"
+                ),
+                base_price=format_money(money),
+                regions_version=version,
+                region_count=len(regional),
+                activated=activate,
+                **base,
+            )
+        except Exception as e:
+            return self._fail_result(
+                ProductSetupResult,
+                f"Failed to create subscription {product_id}",
+                e,
+                **base,
+            )
+
+    def _upload_image_to_edit(
+        self, package_name: str, edit_id: str, language: str, image_type: str, image_path: str
+    ) -> AppImage:
+        """Upload one image into an open edit (no commit)."""
+        service = self._get_service()
+        suffix = Path(image_path).suffix.lower()
+        mimetype = "image/png" if suffix == ".png" else "image/jpeg"
+        media = MediaFileUpload(image_path, mimetype=mimetype, resumable=True)
+        data = self._execute(
+            service.edits()
+            .images()
+            .upload(
+                packageName=package_name,
+                editId=edit_id,
+                language=language,
+                imageType=image_type,
+                media_body=media,
+            )
+        )
+        return self._parse_app_image(package_name, language, image_type, data.get("image") or {})
+
+    def _delete_all_images_in_edit(
+        self, package_name: str, edit_id: str, language: str, image_type: str
+    ) -> int:
+        """Delete every image of a type in an open edit; return how many were removed."""
+        service = self._get_service()
+        result = self._execute(
+            service.edits()
+            .images()
+            .deleteall(
+                packageName=package_name,
+                editId=edit_id,
+                language=language,
+                imageType=image_type,
+            )
+        )
+        return len((result or {}).get("deleted", []))
+
+    @staticmethod
+    def _image_problems(image_type: str, paths: list[str]) -> list[str]:
+        """Validate image paths for one image type before touching the API."""
+        problems: list[str] = []
+        if image_type not in _IMAGE_TYPES:
+            return [
+                f"Unknown image_type {image_type!r}; expected one of "
+                + ", ".join(sorted(_IMAGE_TYPES))
+            ]
+        if not paths:
+            problems.append(f"{image_type}: no image files given")
+        limit = 1 if image_type in _SINGLE_IMAGE_TYPES else _MAX_SCREENSHOTS
+        if len(paths) > limit:
+            problems.append(f"{image_type}: {len(paths)} images given, Google Play allows {limit}")
+        for path in paths:
+            if Path(path).suffix.lower() not in _IMAGE_EXTENSIONS:
+                problems.append(f"{image_type}: {path} is not a .png/.jpg/.jpeg file")
+            elif not Path(path).is_file():
+                problems.append(f"{image_type}: file not found: {path}")
+        return problems
+
+    def replace_images(
+        self,
+        package_name: str,
+        language: str,
+        image_type: str,
+        image_paths: list[str],
+        replace_existing: bool = True,
+    ) -> ImageBatchResult:
+        """Upload several listing images for one language/type in a single edit.
+
+        With ``replace_existing`` (default) the current images of that type
+        are removed first, so the listing ends up with exactly these images,
+        in this order. Everything is one commit: either all of it lands or
+        none of it does.
+
+        Args:
+            package_name: App package name.
+            language: BCP-47 language, e.g. "en-US".
+            image_type: phoneScreenshots, sevenInchScreenshots, tenInchScreenshots,
+                tvScreenshots, wearScreenshots, icon, featureGraphic or tvBanner.
+            image_paths: Local PNG/JPEG files, in display order (max 8 for
+                screenshots, 1 for icon/featureGraphic/tvBanner).
+            replace_existing: Remove existing images of this type first.
+
+        Returns:
+            Result with the uploaded images and how many were removed.
+        """
+        self._logger.info(
+            "Replacing images",
+            package_name=package_name,
+            language=language,
+            image_type=image_type,
+            count=len(image_paths),
+        )
+        base: dict[str, Any] = {
+            "package_name": package_name,
+            "language": language,
+            "image_type": image_type,
+        }
+        problems = self._image_problems(image_type, image_paths)
+        if problems:
+            return ImageBatchResult(
+                success=False,
+                message="Image validation failed: " + "; ".join(problems),
+                error="InvalidInput",
+                **base,
+            )
+
+        edit_id: str | None = None
+        try:
+            edit_id = self._create_edit(package_name)
+            deleted = 0
+            if replace_existing:
+                deleted = self._delete_all_images_in_edit(
+                    package_name, edit_id, language, image_type
+                )
+            uploaded = [
+                self._upload_image_to_edit(package_name, edit_id, language, image_type, path)
+                for path in image_paths
+            ]
+            sent = self._commit_edit(package_name, edit_id)
+            return ImageBatchResult(
+                success=True,
+                message=(
+                    f"Uploaded {len(uploaded)} {image_type} image(s) for {language}"
+                    + (f", replacing {deleted}" if replace_existing else "")
+                    + self._review_note("completed", sent)
+                ),
+                deleted_count=deleted,
+                uploaded=uploaded,
+                sent_for_review=sent,
+                **base,
+            )
+        except Exception as e:
+            return self._fail_result(
+                ImageBatchResult,
+                "Failed to replace images",
+                e,
+                edit_id=edit_id,
+                **base,
+            )
+
+    @staticmethod
+    def _natural_key(path: Path) -> list[Any]:
+        """Sort key so 2.png comes before 10.png."""
+        return [
+            int(part) if part.isdigit() else part.lower() for part in _DIGITS_RE.split(path.name)
+        ]
+
+    def _scan_metadata_language(
+        self, lang_dir: Path
+    ) -> tuple[dict[str, str], dict[str, list[str]]]:
+        """Read text fields and image paths for one language directory."""
+        text: dict[str, str] = {}
+        for filename, field in _LISTING_TEXT_FILES.items():
+            file = lang_dir / filename
+            if file.is_file():
+                text[field] = file.read_text(encoding="utf-8").strip()
+
+        images: dict[str, list[str]] = {}
+        images_dir = lang_dir / "images"
+        if images_dir.is_dir():
+            for image_type in sorted(_SINGLE_IMAGE_TYPES):
+                found = [
+                    images_dir / f"{image_type}{ext}"
+                    for ext in sorted(_IMAGE_EXTENSIONS)
+                    if (images_dir / f"{image_type}{ext}").is_file()
+                ]
+                if found:
+                    images[image_type] = [str(p) for p in found]
+            for image_type in sorted(_SCREENSHOT_TYPES):
+                sub = images_dir / image_type
+                if sub.is_dir():
+                    files = sorted(
+                        (
+                            p
+                            for p in sub.iterdir()
+                            if p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS
+                        ),
+                        key=self._natural_key,
+                    )
+                    if files:
+                        images[image_type] = [str(p) for p in files]
+        return text, images
+
+    def sync_listing_from_directory(
+        self,
+        package_name: str,
+        directory: str,
+        languages: list[str] | None = None,
+        replace_images: bool = True,
+        dry_run: bool = False,
+    ) -> ListingSyncResult:
+        """Sync store listing text and images for every language from a folder.
+
+        The folder uses the fastlane ``supply`` layout, so existing fastlane
+        metadata works unchanged::
+
+            <directory>/
+              en-US/
+                title.txt  short_description.txt  full_description.txt  video.txt
+                images/
+                  icon.png  featureGraphic.png  tvBanner.png
+                  phoneScreenshots/1.png 2.png ...
+                  sevenInchScreenshots/  tenInchScreenshots/
+                  tvScreenshots/  wearScreenshots/
+              de-DE/
+                ...
+
+        Only what exists in the folder is changed: missing text files keep
+        their current value on Play, and image types without files are left
+        alone. Everything is applied in a single edit and one commit.
+
+        Args:
+            package_name: App package name.
+            directory: Path to the metadata folder (e.g. fastlane/metadata/android).
+            languages: Only sync these languages (default: every language folder).
+            replace_images: Remove existing images of each synced type first, so
+                Play ends up with exactly the folder's images (default True).
+                If False, images are added to the existing ones.
+            dry_run: Validate and report what would change without calling Play.
+
+        Returns:
+            Per-language summary, validation problems, and review status.
+        """
+        self._logger.info(
+            "Syncing listing from directory",
+            package_name=package_name,
+            directory=directory,
+            dry_run=dry_run,
+        )
+        root = Path(directory).expanduser()
+        base: dict[str, Any] = {
+            "package_name": package_name,
+            "directory": str(root),
+            "dry_run": dry_run,
+        }
+        if not root.is_dir():
+            return ListingSyncResult(
+                success=False,
+                message=f"Directory not found: {root}",
+                error="NotADirectory",
+                **base,
+            )
+
+        wanted = set(languages) if languages else None
+        lang_dirs = sorted(
+            p
+            for p in root.iterdir()
+            if p.is_dir()
+            and _LANGUAGE_DIR_RE.fullmatch(p.name)
+            and (wanted is None or p.name in wanted)
+        )
+        if wanted:
+            missing = sorted(wanted - {p.name for p in lang_dirs})
+            if missing:
+                return ListingSyncResult(
+                    success=False,
+                    message=f"No folder for language(s): {', '.join(missing)}",
+                    error="InvalidInput",
+                    problems=[f"missing language folder: {lang}" for lang in missing],
+                    **base,
+                )
+
+        plan: list[tuple[str, dict[str, str], dict[str, list[str]]]] = []
+        problems: list[str] = []
+        for lang_dir in lang_dirs:
+            text, images = self._scan_metadata_language(lang_dir)
+            if not text and not images:
+                continue
+            lang = lang_dir.name
+            problems.extend(
+                f"{lang}: {err.message} ({err.value})"
+                for err in self.validate_listing_text(
+                    title=text.get("title"),
+                    short_description=text.get("shortDescription"),
+                    full_description=text.get("fullDescription"),
+                )
+            )
+            for image_type, paths in images.items():
+                problems.extend(f"{lang}: {p}" for p in self._image_problems(image_type, paths))
+            plan.append((lang, text, images))
+
+        summaries = [
+            ListingSyncLanguage(
+                language=lang,
+                text_fields=sorted(text),
+                images={t: len(p) for t, p in images.items()},
+            )
+            for lang, text, images in plan
+        ]
+
+        if problems:
+            return ListingSyncResult(
+                success=False,
+                message=f"Validation failed with {len(problems)} problem(s); nothing was changed",
+                error="InvalidInput",
+                languages=summaries,
+                problems=problems,
+                **base,
+            )
+        if not plan:
+            return ListingSyncResult(
+                success=False,
+                message=f"No listing text or images found under {root}",
+                error="NothingToSync",
+                **base,
+            )
+        if dry_run:
+            return ListingSyncResult(
+                success=True,
+                message=(f"Dry run: would update {len(plan)} language(s); nothing was changed"),
+                languages=summaries,
+                **base,
+            )
+
+        edit_id: str | None = None
+        try:
+            service = self._get_service()
+            edit_id = self._create_edit(package_name)
+            for (lang, text, images), summary in zip(plan, summaries, strict=True):
+                if text:
+                    try:
+                        current = self._execute(
+                            service.edits()
+                            .listings()
+                            .get(packageName=package_name, editId=edit_id, language=lang)
+                        )
+                    except HttpError:
+                        current = {}
+                    body = {
+                        "title": current.get("title", ""),
+                        "shortDescription": current.get("shortDescription", ""),
+                        "fullDescription": current.get("fullDescription", ""),
+                    }
+                    if current.get("video"):
+                        body["video"] = current["video"]
+                    body.update(text)
+                    self._execute(
+                        service.edits()
+                        .listings()
+                        .update(
+                            packageName=package_name,
+                            editId=edit_id,
+                            language=lang,
+                            body=body,
+                        )
+                    )
+                for image_type, paths in images.items():
+                    if replace_images:
+                        summary.deleted_images[image_type] = self._delete_all_images_in_edit(
+                            package_name, edit_id, lang, image_type
+                        )
+                    for path in paths:
+                        self._upload_image_to_edit(package_name, edit_id, lang, image_type, path)
+            sent = self._commit_edit(package_name, edit_id)
+            return ListingSyncResult(
+                success=True,
+                message=(
+                    f"Synced store listing for {len(plan)} language(s)"
+                    + self._review_note("completed", sent)
+                ),
+                languages=summaries,
+                sent_for_review=sent,
+                **base,
+            )
+        except Exception as e:
+            result = self._fail_result(
+                ListingSyncResult,
+                "Listing sync failed; no changes were committed",
+                e,
+                edit_id=edit_id,
+                package_name=package_name,
+                directory=str(root),
+                dry_run=dry_run,
+            )
+            result.languages = summaries
+            return result
 
     # =========================================================================
     # External Transactions API (alternative billing)
