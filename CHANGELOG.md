@@ -55,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are raised instead of overwriting fields with empty values.
 
 ### Fixed
+- `batch_deploy` uploaded the same file once per track, so every track after
+  the first failed (Google accepts each version code once). It now uploads
+  once, puts the release on every track in the same edit and commits once
+  (all-or-nothing, draft-app aware). Unknown tracks in `rollout_percentages`
+  are rejected.
+- `validate_track` rejected custom closed testing tracks such as "P1". It now
+  accepts any well-formed name, and with `package_name` checks the track
+  exists in the app (listing the existing tracks and suggesting a case fix).
 - Read tools (releases, listings, images, testers, APKs, bundles, expansion
   files) share one cached edit per app instead of creating and deleting one per
   call, which quickly hit Play's "Daily edit creation quota exceeded". The

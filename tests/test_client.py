@@ -657,9 +657,10 @@ class TestValidation:
         self,
         client: PlayStoreClient,
     ) -> None:
-        """Test validating invalid track name."""
-        errors = client.validate_track("staging")
-        assert len(errors) > 0
+        """Test validating malformed track names (format check, no API call)."""
+        for track in ["", "   ", " beta"]:
+            errors = client.validate_track(track)
+            assert len(errors) > 0
 
     def test_validate_listing_text_valid(
         self,

@@ -30,7 +30,7 @@ An MCP (Model Context Protocol) server that connects to the Google Play Develope
 
 ## ✨ Features
 
-- 🚀 **App Deployment** — Deploy APK/AAB files to any track (internal, alpha, beta, production)
+- 🚀 **App Deployment** — Deploy APK/AAB files to any track (internal, alpha, beta, production, or custom closed testing tracks)
 - ⚡ **Batch Operations** — Deploy to multiple tracks simultaneously
 - 🌐 **Multi-Language Support** — Deploy with release notes in multiple languages
 - ✅ **Input Validation** — Validate package names, tracks, and text before API calls

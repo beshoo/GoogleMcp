@@ -248,7 +248,8 @@ def deploy_app(
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
-        track: Release track - one of: internal, alpha, beta, production
+        track: Release track - internal, alpha, beta, production, or a custom
+            closed testing track name (e.g. "P1")
         file_path: Absolute path to APK or AAB file
         release_notes: Optional release notes for this version (string for single language,
                       or use release_notes_multilang for multiple languages)
@@ -298,7 +299,8 @@ def deploy_app_multilang(
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
-        track: Release track - one of: internal, alpha, beta, production
+        track: Release track - internal, alpha, beta, production, or a custom
+            closed testing track name (e.g. "P1")
         file_path: Absolute path to APK or AAB file
         release_notes: Dictionary mapping language codes to release notes
                       (e.g., {"en-US": "Bug fixes", "es-ES": "Corrección de errores"})
@@ -394,7 +396,8 @@ def halt_release(
 
     Args:
         package_name: App package name
-        track: Track containing the release (internal, alpha, beta, production)
+        track: Track containing the release (internal, alpha, beta, production, or a
+            custom closed testing track such as "P1")
         version_code: Version code of the release to halt
 
     Returns:
@@ -3526,18 +3529,24 @@ def validate_package_name(package_name: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def validate_track(track: str) -> dict[str, Any]:
-    """Validate track name before using it in deployment operations.
+def validate_track(track: str, package_name: str | None = None) -> dict[str, Any]:
+    """Validate a track name before using it in deployment operations.
+
+    Apps have the built-in tracks (internal, alpha, beta, production) plus any
+    custom closed testing tracks (e.g. "P1") and form-factor tracks (e.g.
+    "wear:production"). Pass package_name to check the track exists in that app;
+    without it only the format is checked.
 
     Args:
-        track: Track name to validate (internal, alpha, beta, production)
+        track: Track name to validate
+        package_name: Optional app package name to check the track exists in
 
     Returns:
-        Validation result with any errors found
+        Validation result with any errors found (lists existing tracks if unknown)
     """
     client = get_client_from_context()
 
-    errors = client.validate_track(track)
+    errors = client.validate_track(track, package_name)
     return {
         "valid": len(errors) == 0,
         "errors": [error.model_dump() for error in errors],
@@ -3583,15 +3592,17 @@ def batch_deploy(
     release_notes: str | None = None,
     rollout_percentages: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    """Deploy an app to multiple tracks in a single operation.
+    """Upload a build once and release it to several tracks in a single commit.
 
-    This is useful for deploying to internal and alpha tracks simultaneously,
-    or for promoting to multiple testing tracks at once.
+    Google Play accepts each version code only once, so the file is uploaded a
+    single time and that version is released to every track together. All or
+    nothing: either every track gets the release or none does.
 
     Args:
         package_name: App package name
         file_path: Absolute path to APK or AAB file
-        tracks: List of tracks to deploy to (e.g., ["internal", "alpha"])
+        tracks: Tracks to release to, e.g. ["internal", "P1"] (custom closed
+            testing tracks are allowed)
         release_notes: Optional release notes for all tracks
         rollout_percentages: Optional dict mapping track names to rollout percentages
 

@@ -121,7 +121,7 @@ def main() -> None:
         print_error("Valid track failed validation")
 
     # Invalid track
-    errors = client.validate_track("staging")
+    errors = client.validate_track("")
     if len(errors) > 0:
         print_success("Invalid track caught errors")
     else:

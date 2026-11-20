@@ -115,6 +115,9 @@ MAX_BACKOFF = 32.0  # seconds
 _MIME_TYPE_AAB = "application/octet-stream"
 _MIME_TYPE_APK = "application/vnd.android.package-archive"
 
+# Longest track name we accept (custom closed testing tracks have free-form names).
+_MAX_TRACK_NAME_LENGTH = 100
+
 # Default schema version for regional pricing data
 DEFAULT_REGIONS_VERSION = "2022/02"
 
@@ -472,28 +475,72 @@ class PlayStoreClient:
 
         return errors
 
-    def validate_track(self, track: str) -> list[ValidationResult]:
-        """Validate track name.
+    def validate_track(self, track: str, package_name: str | None = None) -> list[ValidationResult]:
+        """Validate a track name.
+
+        Besides the built-in tracks (internal, alpha, beta, production), apps
+        can have custom closed testing tracks with any name (e.g. "P1") and
+        form-factor tracks (e.g. "wear:production"), so the name alone can't
+        be checked against a fixed list. Without ``package_name`` only the
+        format is checked; with it, the track must exist in that app.
 
         Args:
             track: Track name to validate.
+            package_name: Optional app to check the track exists in.
 
         Returns:
             List of validation errors (empty if valid).
         """
         errors: list[ValidationResult] = []
-        valid_tracks = ["internal", "alpha", "beta", "production"]
-
-        if track not in valid_tracks:
+        if not track or not track.strip():
+            return [ValidationResult(field="track", message="Track name is empty", value=track)]
+        if track != track.strip():
             errors.append(
                 ValidationResult(
                     field="track",
-                    message=f"Track must be one of: {', '.join(valid_tracks)}",
+                    message="Track name has leading or trailing spaces",
                     value=track,
                 )
             )
+        if len(track) > _MAX_TRACK_NAME_LENGTH:
+            errors.append(
+                ValidationResult(
+                    field="track",
+                    message=f"Track name must be {_MAX_TRACK_NAME_LENGTH} characters or less",
+                    value=f"{len(track)} characters",
+                )
+            )
+        if errors or package_name is None:
+            return errors
 
+        existing = self.list_track_names(package_name)
+        if track not in existing:
+            close = [name for name in existing if name.lower() == track.lower()]
+            hint = f" Did you mean {close[0]!r}?" if close else ""
+            errors.append(
+                ValidationResult(
+                    field="track",
+                    message=(
+                        f"Track {track!r} does not exist in {package_name}. Existing tracks: "
+                        f"{', '.join(existing) or '(none)'}.{hint}"
+                    ),
+                    value=track,
+                )
+            )
         return errors
+
+    def list_track_names(self, package_name: str) -> list[str]:
+        """Return the names of all tracks in an app, including custom closed tracks."""
+        service = self._get_service()
+        edit_id = self._acquire_read_edit(package_name)
+        try:
+            result = self._execute(
+                service.edits().tracks().list(packageName=package_name, editId=edit_id)
+            )
+        except HttpError as e:
+            self._logger.exception("Failed to list tracks", error=str(e))
+            raise PlayStoreClientError(f"Failed to list tracks: {e.reason}") from e
+        return [t["track"] for t in (result or {}).get("tracks", []) if t.get("track")]
 
     def validate_listing_text(
         self,
@@ -904,37 +951,61 @@ class PlayStoreClient:
         Returns:
             ``(release_status_used, sent_for_review)``.
         """
+        return self._update_tracks_and_commit(package_name, edit_id, {track: release_body})
+
+    def _update_tracks_and_commit(
+        self,
+        package_name: str,
+        edit_id: str,
+        release_bodies: dict[str, dict[str, Any]],
+    ) -> tuple[str, bool]:
+        """Put a release on each track in ``release_bodies`` and commit once.
+
+        Same draft-app handling as ``_update_track_and_commit``: if Play says
+        the app is still a draft, every release is re-applied as a draft in
+        the same edit and committed again.
+
+        Returns:
+            ``(release_status_used, sent_for_review)``; the status is "draft"
+            when the fallback was used, otherwise "completed"/"inProgress"
+            (the first track's status).
+        """
         service = self._get_service()
 
-        def _apply(body: dict[str, Any]) -> bool:
-            self._execute(
-                service.edits()
-                .tracks()
-                .update(
-                    packageName=package_name,
-                    editId=edit_id,
-                    track=track,
-                    body={"releases": [body]},
+        def _apply(bodies: dict[str, dict[str, Any]]) -> bool:
+            for track, body in bodies.items():
+                self._execute(
+                    service.edits()
+                    .tracks()
+                    .update(
+                        packageName=package_name,
+                        editId=edit_id,
+                        track=track,
+                        body={"releases": [body]},
+                    )
                 )
-            )
             return self._commit_edit(package_name, edit_id, allow_not_sent_for_review=True)
 
-        status = str(release_body.get("status", "completed"))
+        statuses = {str(body.get("status", "completed")) for body in release_bodies.values()}
+        first_status = str(next(iter(release_bodies.values())).get("status", "completed"))
         try:
-            return status, _apply(release_body)
+            return first_status, _apply(release_bodies)
         except HttpError as e:
-            if status == "draft" or not self._is_draft_app_error(e):
+            if statuses == {"draft"} or not self._is_draft_app_error(e):
                 raise
             self._logger.warning(
                 "App is still a draft on Google Play; retrying the release with status=draft",
                 package_name=package_name,
-                track=track,
+                tracks=list(release_bodies),
             )
-            draft_body = {
-                key: value for key, value in release_body.items() if key != "userFraction"
+            drafts = {
+                track: {
+                    **{key: value for key, value in body.items() if key != "userFraction"},
+                    "status": "draft",
+                }
+                for track, body in release_bodies.items()
             }
-            draft_body["status"] = "draft"
-            return "draft", _apply(draft_body)
+            return "draft", _apply(drafts)
 
     @staticmethod
     def _review_note(release_status: str, sent_for_review: bool) -> str:
@@ -1120,7 +1191,8 @@ class PlayStoreClient:
 
         Args:
             package_name: App package name.
-            track: Target track (internal, alpha, beta, production).
+            track: Target track (internal, alpha, beta, production, or a custom
+                closed testing track such as "P1").
             file_path: Path to APK or AAB file.
             release_notes: Release notes text (string for single language) or
                           dict mapping language codes to release notes for multiple languages.
@@ -2355,59 +2427,120 @@ class PlayStoreClient:
         release_notes: str | dict[str, str] | None = None,
         rollout_percentages: dict[str, float] | None = None,
     ) -> BatchDeploymentResult:
-        """Deploy to multiple tracks in a single operation.
+        """Upload a build once and release it to several tracks in one commit.
+
+        Google Play accepts each version code only once, so the file is
+        uploaded a single time and the resulting version is put on every
+        track in the same edit. It is all-or-nothing: either every track gets
+        the release, or none does.
 
         Args:
             package_name: App package name.
             file_path: Path to APK or AAB file.
-            tracks: List of tracks to deploy to (e.g., ["internal", "alpha"]).
-            release_notes: Release notes (string or dict for multi-language).
-            rollout_percentages: Optional dict mapping track to rollout percentage.
+            tracks: Tracks to release to (e.g. ["internal", "P1"]). Duplicates
+                are ignored.
+            release_notes: Release notes (string, or dict for multi-language).
+            rollout_percentages: Optional dict mapping track to rollout percentage
+                (default 100 for every track).
 
         Returns:
-            Batch deployment result with individual results.
+            Batch deployment result with one entry per track.
         """
+        unique_tracks = list(dict.fromkeys(tracks))
+        rollouts = dict(rollout_percentages or {})
         self._logger.info(
-            "Starting batch deployment",
-            package_name=package_name,
-            tracks=tracks,
+            "Starting batch deployment", package_name=package_name, tracks=unique_tracks
         )
 
-        results: list[DeploymentResult] = []
-        successful = 0
-        failed = 0
-
-        for track in tracks:
-            rollout = 100.0
-            if rollout_percentages and track in rollout_percentages:
-                rollout = rollout_percentages[track]
-
-            result = self.deploy_app(
-                package_name=package_name,
-                track=track,
-                file_path=file_path,
-                release_notes=release_notes,
-                rollout_percentage=rollout,
+        def _all_failed(message: str, error: str) -> BatchDeploymentResult:
+            results = [
+                DeploymentResult(
+                    success=False,
+                    package_name=package_name,
+                    track=track,
+                    message=message,
+                    error=error,
+                )
+                for track in unique_tracks
+            ]
+            return BatchDeploymentResult(
+                success=False,
+                results=results,
+                successful_count=0,
+                failed_count=len(results),
+                message=message,
             )
 
-            results.append(result)
-            if result.success:
-                successful += 1
-            else:
-                failed += 1
+        if not unique_tracks:
+            return BatchDeploymentResult(
+                success=True, results=[], message="No tracks given; nothing was deployed"
+            )
+        stray = sorted(set(rollouts) - set(unique_tracks))
+        if stray:
+            return _all_failed(
+                f"rollout_percentages names tracks that are not being deployed: {', '.join(stray)}",
+                "InvalidInput",
+            )
+        if not Path(file_path).exists():
+            return _all_failed(f"File not found: {file_path}", "FileNotFoundError")
 
-        all_success = failed == 0
-        message = f"Deployed to {successful}/{len(tracks)} tracks successfully"
-        if failed > 0:
-            message += f" ({failed} failed)"
+        edit_id: str | None = None
+        try:
+            service = self._get_service()
+            edit_id = self._create_edit(package_name)
 
-        return BatchDeploymentResult(
-            success=all_success,
-            results=results,
-            successful_count=successful,
-            failed_count=failed,
-            message=message,
-        )
+            is_bundle = file_path.lower().endswith(".aab")
+            media = MediaFileUpload(
+                file_path, mimetype=_MIME_TYPE_AAB if is_bundle else _MIME_TYPE_APK, resumable=True
+            )
+            uploads = service.edits().bundles() if is_bundle else service.edits().apks()
+            upload_response = self._execute(
+                uploads.upload(packageName=package_name, editId=edit_id, media_body=media)
+            )
+            version_code = int(upload_response.get("versionCode", 0))
+            self._logger.info("Upload complete", version_code=version_code)
+
+            bodies = {
+                track: self._build_release_body(
+                    version_code, rollouts.get(track, 100.0), release_notes, "en-US"
+                )
+                for track in unique_tracks
+            }
+            status_used, sent = self._update_tracks_and_commit(package_name, edit_id, bodies)
+            note = self._review_note(status_used, sent)
+
+            results = [
+                DeploymentResult(
+                    success=True,
+                    edit_id=edit_id,
+                    package_name=package_name,
+                    track=track,
+                    version_code=version_code,
+                    message=f"Released version {version_code} to {track}"
+                    + (
+                        f" at {rollouts[track]:g}%"
+                        if rollouts.get(track, 100.0) < 100 and status_used != "draft"
+                        else ""
+                    ),
+                )
+                for track in unique_tracks
+            ]
+            return BatchDeploymentResult(
+                success=True,
+                results=results,
+                successful_count=len(results),
+                failed_count=0,
+                message=(
+                    f"Uploaded version {version_code} once and released it to "
+                    f"{len(results)} track(s): {', '.join(unique_tracks)}" + note
+                ),
+            )
+        except Exception as e:
+            reason = self._error_reason(e)
+            self._logger.exception("Batch deployment failed", error=str(e))
+            if edit_id is not None:
+                self._delete_edit(package_name, edit_id)
+            return _all_failed(f"Batch deployment failed; nothing was released: {reason}", str(e))
 
     # =========================================================================
     # In-App Products API

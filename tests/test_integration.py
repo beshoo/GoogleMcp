@@ -230,7 +230,7 @@ class TestValidation:
 
     def test_validate_track_invalid(self, real_client: PlayStoreClient) -> None:
         """Test validating invalid track."""
-        errors = real_client.validate_track("staging")
+        errors = real_client.validate_track("")
         assert len(errors) > 0
         print(f"✓ Invalid track caught {len(errors)} errors")
 

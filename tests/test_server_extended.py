@@ -715,7 +715,7 @@ class TestValidationTools:
 
         result = validate_track("production")
 
-        mock_client.validate_track.assert_called_once_with("production")
+        mock_client.validate_track.assert_called_once_with("production", None)
         assert result["valid"] is True
 
     def test_validate_listing_text(self, mock_client: MagicMock) -> None:

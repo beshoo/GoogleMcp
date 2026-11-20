@@ -1050,34 +1050,23 @@ class TestBatchDeployExtended:
         assert result.success is True
         assert result.successful_count == 2
 
-    def test_batch_deploy_partial_failure(
+    def test_batch_deploy_failure_is_all_or_nothing(
         self,
         client: PlayStoreClient,
         _mock_service: MagicMock,
         tmp_path: Any,
     ) -> None:
-        """Test batch deploy where one track fails."""
+        """If any track fails, nothing is committed and every track reports failure."""
         apk_file = tmp_path / "app.apk"
         apk_file.write_bytes(b"content")
 
         mock_edits = _mock_service.edits.return_value
         mock_edits.insert.return_value.execute.return_value = {"id": "edit-123"}
-
-        call_count = 0
-
-        def upload_side_effect(**_kwargs: Any) -> MagicMock:
-            nonlocal call_count
-            call_count += 1
-            mock = MagicMock()
-            if call_count > 1:
-                mock.execute.side_effect = _make_http_error(403)
-            else:
-                mock.execute.return_value = {"versionCode": 100}
-            return mock
-
-        mock_edits.apks.return_value.upload.side_effect = upload_side_effect
-        mock_edits.tracks.return_value.update.return_value.execute.return_value = {}
-        mock_edits.commit.return_value.execute.return_value = {}
+        mock_edits.apks.return_value.upload.return_value.execute.return_value = {"versionCode": 100}
+        mock_edits.tracks.return_value.update.return_value.execute.side_effect = [
+            {},
+            _make_http_error(403),
+        ]
         mock_edits.delete.return_value.execute.return_value = None
 
         result = client.batch_deploy(
@@ -1087,9 +1076,11 @@ class TestBatchDeployExtended:
         )
 
         assert result.success is False
-        assert result.successful_count == 1
-        assert result.failed_count == 1
-        assert "failed" in result.message.lower()
+        assert result.successful_count == 0
+        assert result.failed_count == 2
+        assert "nothing was released" in result.message
+        mock_edits.commit.assert_not_called()
+        mock_edits.delete.assert_called_once()
 
 
 # =========================================================================
